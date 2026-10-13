@@ -1,0 +1,17 @@
+# Zig build outputs and local caches
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local profiling and temporary artifacts
+*.profraw
+*.profdata
+*.tmp
