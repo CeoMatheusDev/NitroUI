@@ -1,4 +1,4 @@
-name: Zig tests
+name: Zig CI
 
 on:
   push:
@@ -10,15 +10,35 @@ permissions:
 
 jobs:
   test:
+    name: Build, tests, integration and benchmarks
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Install Zig 0.17.0
         uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
+
       - name: Check formatting
-        run: zig fmt --check build.zig src
-      - name: Run unit tests
-        run: zig build test
+        run: zig fmt --check build.zig src bench examples
+
+      - name: Build Debug
+        run: zig build
+
+      - name: Unit tests Debug
+        run: zig build test --summary all
+
+      - name: Unit tests ReleaseFast
+        run: zig build test -Doptimize=ReleaseFast --summary all
+
+      - name: Integration Debug
+        run: zig build integration
+
+      - name: Integration ReleaseFast
+        run: zig build integration -Doptimize=ReleaseFast
+
+      - name: Benchmarks ReleaseFast
+        run: zig build bench -Doptimize=ReleaseFast
