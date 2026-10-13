@@ -54,6 +54,7 @@ pub const ByteArena = struct {
     }
 
     pub fn remaining(self: *const ByteArena) usize {
+        if (self.used >= self.storage.len) return 0;
         return self.storage.len - self.used;
     }
 };
@@ -101,8 +102,56 @@ test "aligned reservations and padding" {
 
 test "aligned reservation rejects overflow without mutation" {
     const testing = std.testing;
-    var storage: [16]u8 = undefined;
-    var arena = ByteArena.init(&storage);
+    var storage: [17]u8 = undefined;
+    // A and A+1 mod 8 cannot both be zero, so one of these slices is
+    // surely misaligned: padding is nonzero and maxInt always overflows.
+    const slice: []u8 = if (@intFromPtr(storage[0..].ptr) & 7 == 0) storage[1..] else storage[0..];
+    var arena = ByteArena.init(slice);
     try testing.expectError(error.SizeOverflow, arena.reserveAligned(std.math.maxInt(usize), 8));
     try testing.expectEqual(@as(usize, 0), arena.used);
+}
+
+test "aligned reservation at exact boundary and subsequent failure" {
+    const testing = std.testing;
+    var storage: [32]u8 align(16) = undefined;
+    var arena = ByteArena.init(&storage);
+    const block = try arena.reserveAligned(32, 16);
+    try testing.expectEqual(@as(usize, 32), block.len);
+    try testing.expectEqual(@as(usize, 32), arena.used);
+    try testing.expectError(error.OutOfCapacity, arena.reserveAligned(1, 16));
+    try testing.expectEqual(@as(usize, 32), arena.used);
+    try testing.expectEqual(@as(usize, 32), arena.high_watermark);
+}
+
+test "alignment failure after nonzero prefix preserves counters" {
+    const testing = std.testing;
+    var storage: [32]u8 align(16) = undefined;
+    var arena = ByteArena.init(&storage);
+    _ = try arena.reserve(3);
+    try testing.expectError(error.OutOfCapacity, arena.reserveAligned(32, 16));
+    try testing.expectEqual(@as(usize, 3), arena.used);
+    try testing.expectEqual(@as(usize, 3), arena.high_watermark);
+    const block = try arena.reserveAligned(16, 16);
+    try testing.expectEqual(@as(usize, 0), @intFromPtr(block.ptr) & 15);
+    try testing.expectEqual(@as(usize, 32), arena.used);
+}
+
+test "invalid alignments never advance cursor" {
+    const testing = std.testing;
+    var storage: [8]u8 = undefined;
+    var arena = ByteArena.init(&storage);
+    _ = try arena.reserve(2);
+    try testing.expectError(error.InvalidAlignment, arena.reserveAligned(1, 0));
+    try testing.expectError(error.InvalidAlignment, arena.reserveAligned(1, 6));
+    try testing.expectEqual(@as(usize, 2), arena.used);
+    try testing.expectEqual(@as(usize, 2), arena.high_watermark);
+}
+
+test "stage24_8 remaining saturates on corrupted cursor" {
+    const testing = std.testing;
+    var storage: [8]u8 = undefined;
+    var arena = ByteArena.init(&storage);
+    _ = try arena.reserve(8);
+    arena.used = 24;
+    try testing.expectEqual(@as(usize, 0), arena.remaining());
 }

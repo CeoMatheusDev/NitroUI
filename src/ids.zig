@@ -46,6 +46,7 @@ pub const Stack = struct {
     }
 
     pub fn current(self: *const Stack) Id {
+        if (self.depth > max_depth) return offset_basis;
         return self.seeds[self.depth];
     }
 
@@ -58,14 +59,14 @@ pub const Stack = struct {
     }
 
     pub fn pushString(self: *Stack, label: []const u8) Error!void {
-        if (self.depth == max_depth) return error.ScopeOverflow;
+        if (self.depth >= max_depth) return error.ScopeOverflow;
         const next = self.idString(label);
         self.depth += 1;
         self.seeds[self.depth] = next;
     }
 
     pub fn pushInteger(self: *Stack, value: u64) Error!void {
-        if (self.depth == max_depth) return error.ScopeOverflow;
+        if (self.depth >= max_depth) return error.ScopeOverflow;
         const next = self.idInteger(value);
         self.depth += 1;
         self.seeds[self.depth] = next;
@@ -110,4 +111,13 @@ test "scope limits and recovery" {
     try s.validateBalanced();
     s.reset();
     try s.validateBalanced();
+}
+
+test "stage24_8 corrupted depth cannot cause out-of-bounds access" {
+    const testing = std.testing;
+    var s = Stack.init();
+    s.depth = max_depth + 5;
+    try testing.expectError(error.ScopeOverflow, s.pushString("x"));
+    try testing.expectError(error.ScopeOverflow, s.pushInteger(1));
+    try testing.expectEqual(offset_basis, s.current());
 }

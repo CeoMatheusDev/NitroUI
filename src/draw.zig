@@ -8,6 +8,7 @@ pub const Vertex = extern struct {
     v: f32,
     color: u32, // RGBA8 packed as 0xAABBGGRR (numeric value)
 };
+pub const CornerRadii = struct { top_left: f32, top_right: f32, bottom_right: f32, bottom_left: f32 };
 pub const ClipRect = struct { min_x: f32, min_y: f32, max_x: f32, max_y: f32 };
 pub const Command = struct {
     first_index: u32,
@@ -16,6 +17,17 @@ pub const Command = struct {
     clip: ClipRect,
 };
 pub const Error = error{ OutOfCapacity, InvalidGeometry, InvalidClip, IndexOverflow };
+
+/// Borrowed, read-only view of the geometry produced for one frame.
+/// The backing storage belongs to the engine. The slices are valid only while
+/// the owning Context remains in the ready state, before releaseFrame().
+/// `const` restricts mutation through this view; it does not prevent the
+/// storage owner from modifying or reusing the same memory.
+pub const View = struct {
+    vertices: []const Vertex,
+    indices: []const u32,
+    commands: []const Command,
+};
 
 pub const Buffer = struct {
     vertices: []Vertex,
@@ -33,6 +45,16 @@ pub const Buffer = struct {
         self.index_count = 0;
         self.command_count = 0;
     }
+    /// Return only initialized elements, without copying the buffers.
+    /// Caller must ensure the public counters satisfy the buffer invariants.
+    pub fn view(self: *const Buffer) View {
+        return .{
+            .vertices = self.vertexSlice(),
+            .indices = self.indexSlice(),
+            .commands = self.commandSlice(),
+        };
+    }
+
     pub fn vertexSlice(self: *const Buffer) []const Vertex {
         return self.vertices[0..self.vertex_count];
     }
@@ -43,13 +65,28 @@ pub const Buffer = struct {
         return self.commands[0..self.command_count];
     }
 
+    /// Validate caller-visible counters and capacity before any buffer access.
+    /// Public counters remain writable for API compatibility in 0.1.0.
+    fn preflight(self: *const Buffer, vertices_needed: usize, indices_needed: usize) Error!void {
+        if (self.vertex_count > self.vertices.len or self.index_count > self.indices.len or self.command_count > self.commands.len) return error.OutOfCapacity;
+        if (self.vertex_count > std.math.maxInt(u32) or self.index_count > std.math.maxInt(u32)) return error.IndexOverflow;
+        if (vertices_needed > std.math.maxInt(u32) - self.vertex_count or indices_needed > std.math.maxInt(u32) - self.index_count) return error.IndexOverflow;
+        if (self.vertices.len - self.vertex_count < vertices_needed or self.indices.len - self.index_count < indices_needed) return error.OutOfCapacity;
+        if (self.command_count > 0) {
+            const previous = self.commands[self.command_count - 1];
+            const end = @as(u64, previous.first_index) + @as(u64, previous.index_count);
+            if (end != @as(u64, @intCast(self.index_count))) return error.InvalidGeometry;
+        } else if (self.index_count != 0) {
+            return error.InvalidGeometry;
+        }
+    }
+
     /// Append one filled triangle. Positions are logical display coordinates.
     /// The entire operation is rejected before writing if capacity is insufficient.
     pub fn addTriangle(self: *Buffer, a: [2]f32, b: [2]f32, c: [2]f32, color: u32, texture: u64, clip: ClipRect) Error!void {
         if (!valid(a[0]) or !valid(a[1]) or !valid(b[0]) or !valid(b[1]) or !valid(c[0]) or !valid(c[1])) return error.InvalidGeometry;
         if (!validClip(clip)) return error.InvalidClip;
-        if (self.vertices.len - self.vertex_count < 3 or self.indices.len - self.index_count < 3) return error.OutOfCapacity;
-        if (self.vertex_count > std.math.maxInt(u32) - 3 or self.index_count > std.math.maxInt(u32) - 3) return error.IndexOverflow;
+        try self.preflight(3, 3);
         const merge = self.canMerge(texture, clip, 3);
         if (!merge and self.command_count == self.commands.len) return error.OutOfCapacity;
         const base: u32 = @intCast(self.vertex_count);
@@ -97,8 +134,7 @@ pub const Buffer = struct {
         const n: usize = @intCast(segments);
         const vcount = n + 1;
         const icount = n * 3;
-        if (self.vertices.len - self.vertex_count < vcount or self.indices.len - self.index_count < icount) return error.OutOfCapacity;
-        if (self.vertex_count > std.math.maxInt(u32) - vcount or self.index_count > std.math.maxInt(u32) - icount) return error.IndexOverflow;
+        try self.preflight(vcount, icount);
         const merge = self.canMerge(texture, clip, @intCast(icount));
         if (!merge and self.command_count == self.commands.len) return error.OutOfCapacity;
         // Prevalidate all generated coordinates so errors never leave partial geometry.
@@ -136,10 +172,93 @@ pub const Buffer = struct {
         }
     }
 
+    /// Filled rounded rectangle with independent corner radii.
+    /// segments_per_corner is 1..32. Geometry and capacity are validated before writing.
+    /// UVs are (0,0), matching untextured triangle geometry; texture is a batching handle.
+    pub fn addRoundedRect(self: *Buffer, x0: f32, y0: f32, x1: f32, y1: f32, radii: CornerRadii, segments_per_corner: u8, color: u32, texture: u64, clip_rect: ClipRect) Error!void {
+        if (!valid(x0) or !valid(y0) or !valid(x1) or !valid(y1) or x1 <= x0 or y1 <= y0) return error.InvalidGeometry;
+        if (!validClip(clip_rect)) return error.InvalidClip;
+        if (segments_per_corner == 0 or segments_per_corner > 32) return error.InvalidGeometry;
+        var r = [4]f32{ radii.top_left, radii.top_right, radii.bottom_right, radii.bottom_left };
+        for (r) |radius| {
+            if (!valid(radius) or radius < 0) return error.InvalidGeometry;
+        }
+        if (r[0] == 0 and r[1] == 0 and r[2] == 0 and r[3] == 0) return self.addRect(x0, y0, x1, y1, color, texture, clip_rect);
+        const width = x1 - x0;
+        const height = y1 - y0;
+        if (!valid(width) or !valid(height)) return error.InvalidGeometry;
+        // CSS-style uniform scaling prevents adjacent radii from overlapping.
+        var scale: f32 = 1;
+        const pairs = [4]struct { sum: f32, limit: f32 }{
+            .{ .sum = r[0] + r[1], .limit = width },
+            .{ .sum = r[1] + r[2], .limit = height },
+            .{ .sum = r[2] + r[3], .limit = width },
+            .{ .sum = r[3] + r[0], .limit = height },
+        };
+        for (pairs) |pair| {
+            if (pair.sum > pair.limit) scale = @min(scale, pair.limit / pair.sum);
+        }
+        for (&r) |*radius| radius.* *= scale;
+        const n: usize = @intCast(segments_per_corner);
+        const perimeter = 4 * (n + 1);
+        const vcount = perimeter + 1;
+        const icount = perimeter * 3;
+        if (self.vertex_count > self.vertices.len or self.index_count > self.indices.len or self.command_count > self.commands.len) return error.OutOfCapacity;
+        try self.preflight(vcount, icount);
+        const merge = self.canMerge(texture, clip_rect, @intCast(icount));
+        if (!merge and self.command_count == self.commands.len) return error.OutOfCapacity;
+        const centers = [4][2]f32{
+            .{ x0 + r[0], y0 + r[0] }, .{ x1 - r[1], y0 + r[1] },
+            .{ x1 - r[2], y1 - r[2] }, .{ x0 + r[3], y1 - r[3] },
+        };
+        const start_angles = [4]f32{ std.math.pi, 1.5 * std.math.pi, 0, 0.5 * std.math.pi };
+        const step: f32 = (0.5 * std.math.pi) / @as(f32, @floatFromInt(n));
+        const mid_x = x0 + width * 0.5;
+        const mid_y = y0 + height * 0.5;
+        if (!valid(mid_x) or !valid(mid_y)) return error.InvalidGeometry;
+        // Preflight ensures an error cannot leave partially appended geometry.
+        for (0..4) |corner| {
+            for (0..n + 1) |i| {
+                const angle = start_angles[corner] + step * @as(f32, @floatFromInt(i));
+                const px = centers[corner][0] + r[corner] * @cos(angle);
+                const py = centers[corner][1] + r[corner] * @sin(angle);
+                if (!valid(px) or !valid(py)) return error.InvalidGeometry;
+            }
+        }
+        const base: u32 = @intCast(self.vertex_count);
+        const first: u32 = @intCast(self.index_count);
+        self.vertices[self.vertex_count] = .{ .x = mid_x, .y = mid_y, .u = 0, .v = 0, .color = color };
+        for (0..4) |corner| {
+            for (0..n + 1) |i| {
+                const angle = start_angles[corner] + step * @as(f32, @floatFromInt(i));
+                self.vertices[self.vertex_count + 1 + corner * (n + 1) + i] = .{
+                    .x = centers[corner][0] + r[corner] * @cos(angle),
+                    .y = centers[corner][1] + r[corner] * @sin(angle),
+                    .u = 0,
+                    .v = 0,
+                    .color = color,
+                };
+            }
+        }
+        for (0..perimeter) |i| {
+            const offset = self.index_count + i * 3;
+            self.indices[offset] = base;
+            self.indices[offset + 1] = base + 1 + @as(u32, @intCast(i));
+            self.indices[offset + 2] = base + 1 + @as(u32, @intCast((i + 1) % perimeter));
+        }
+        self.vertex_count += vcount;
+        self.index_count += icount;
+        if (merge) {
+            self.commands[self.command_count - 1].index_count += @intCast(icount);
+        } else {
+            self.commands[self.command_count] = .{ .first_index = first, .index_count = @intCast(icount), .texture = texture, .clip = clip_rect };
+            self.command_count += 1;
+        }
+    }
+
     fn addQuad(self: *Buffer, points: [4][2]f32, color: u32, texture: u64, clip: ClipRect) Error!void {
         if (!validClip(clip)) return error.InvalidClip;
-        if (self.vertices.len - self.vertex_count < 4 or self.indices.len - self.index_count < 6) return error.OutOfCapacity;
-        if (self.vertex_count > std.math.maxInt(u32) - 4 or self.index_count > std.math.maxInt(u32) - 6) return error.IndexOverflow;
+        try self.preflight(4, 6);
         const merge = self.canMerge(texture, clip, 6);
         if (!merge and self.command_count == self.commands.len) return error.OutOfCapacity;
         const base: u32 = @intCast(self.vertex_count);
@@ -171,8 +290,7 @@ pub const Buffer = struct {
     pub fn addRect(self: *Buffer, x0: f32, y0: f32, x1: f32, y1: f32, color: u32, texture: u64, clip: ClipRect) Error!void {
         if (!valid(x0) or !valid(y0) or !valid(x1) or !valid(y1) or x1 < x0 or y1 < y0) return error.InvalidGeometry;
         if (!validClip(clip)) return error.InvalidClip;
-        if (self.vertices.len - self.vertex_count < 4 or self.indices.len - self.index_count < 6) return error.OutOfCapacity;
-        if (self.vertex_count > std.math.maxInt(u32) - 4 or self.index_count > std.math.maxInt(u32) - 6) return error.IndexOverflow;
+        try self.preflight(4, 6);
         const merge = self.canMerge(texture, clip, 6);
         if (!merge and self.command_count == self.commands.len) return error.OutOfCapacity;
         const base: u32 = @intCast(self.vertex_count);
@@ -277,4 +395,134 @@ test "line and circle batching, capacity, invalid geometry" {
     try std.testing.expectError(error.OutOfCapacity, buffer.addCircle(.{ 20, 20 }, 5, 4, 0, 0, region));
     try std.testing.expectError(error.InvalidGeometry, buffer.addCircle(.{ 20, 20 }, 5, 2, 0, 0, region));
     try std.testing.expectEqual(@as(usize, 18), buffer.index_count);
+}
+
+test "draw audit: failed append preserves geometry and command metadata" {
+    var vertices: [8]Vertex = undefined;
+    var indices: [12]u32 = undefined;
+    var commands: [1]Command = undefined;
+    var buffer = Buffer.init(&vertices, &indices, &commands);
+    const region: ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    try buffer.addRect(0, 0, 10, 10, 0xffffffff, 1, region);
+    const before = buffer.commands[0];
+    try std.testing.expectError(error.OutOfCapacity, buffer.addTriangle(.{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, 0, 2, region));
+    try std.testing.expectEqual(@as(usize, 4), buffer.vertex_count);
+    try std.testing.expectEqual(@as(usize, 6), buffer.index_count);
+    try std.testing.expectEqual(@as(usize, 1), buffer.command_count);
+    try std.testing.expect(std.meta.eql(before, buffer.commands[0]));
+    try buffer.addRect(10, 0, 20, 10, 0xffffffff, 1, region);
+    try std.testing.expectEqual(@as(u32, 12), buffer.commands[0].index_count);
+}
+
+test "draw audit: indices remain in bounds across mixed primitives" {
+    var vertices: [32]Vertex = undefined;
+    var indices: [64]u32 = undefined;
+    var commands: [4]Command = undefined;
+    var buffer = Buffer.init(&vertices, &indices, &commands);
+    const region: ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    try buffer.addRect(0, 0, 10, 10, 0xffffffff, 0, region);
+    try buffer.addTriangle(.{ 0, 0 }, .{ 10, 0 }, .{ 0, 10 }, 0xffffffff, 0, region);
+    try buffer.addLine(.{ 0, 20 }, .{ 20, 20 }, 2, 0xffffffff, 0, region);
+    try buffer.addCircle(.{ 30, 30 }, 5, 8, 0xffffffff, 0, region);
+    try std.testing.expectEqual(@as(usize, 1), buffer.command_count);
+    try std.testing.expectEqual(@as(u32, @intCast(buffer.index_count)), buffer.commands[0].index_count);
+    for (buffer.indexSlice()) |idx| {
+        try std.testing.expect(@as(usize, idx) < buffer.vertex_count);
+    }
+}
+
+test "draw audit: clip and texture changes split commands" {
+    var vertices: [16]Vertex = undefined;
+    var indices: [24]u32 = undefined;
+    var commands: [4]Command = undefined;
+    var buffer = Buffer.init(&vertices, &indices, &commands);
+    const a: ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    const b: ClipRect = .{ .min_x = 1, .min_y = 0, .max_x = 100, .max_y = 100 };
+    try buffer.addRect(0, 0, 10, 10, 0, 1, a);
+    try buffer.addRect(0, 0, 10, 10, 0, 1, b);
+    try buffer.addRect(0, 0, 10, 10, 0, 2, b);
+    try buffer.addRect(0, 0, 10, 10, 0, 2, b);
+    try std.testing.expectEqual(@as(usize, 3), buffer.command_count);
+    try std.testing.expectEqual(@as(u32, 0), buffer.commands[0].first_index);
+    try std.testing.expectEqual(@as(u32, 6), buffer.commands[1].first_index);
+    try std.testing.expectEqual(@as(u32, 12), buffer.commands[2].first_index);
+    try std.testing.expectEqual(@as(u32, 12), buffer.commands[2].index_count);
+}
+
+test "rounded rectangle indices and batching" {
+    var vertices: [64]Vertex = undefined;
+    var indices: [180]u32 = undefined;
+    var commands: [2]Command = undefined;
+    var buffer = Buffer.init(&vertices, &indices, &commands);
+    const region: ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 200 };
+    const radii: CornerRadii = .{ .top_left = 6, .top_right = 10, .bottom_right = 8, .bottom_left = 2 };
+    try buffer.addRoundedRect(0, 0, 40, 30, radii, 3, 0xffffffff, 0, region);
+    try std.testing.expectEqual(@as(usize, 17), buffer.vertex_count);
+    try std.testing.expectEqual(@as(usize, 48), buffer.index_count);
+    for (buffer.indexSlice()) |index| try std.testing.expect(index < buffer.vertex_count);
+    try buffer.addRoundedRect(40, 0, 80, 30, radii, 3, 0xffffffff, 0, region);
+    try std.testing.expectEqual(@as(usize, 1), buffer.command_count);
+    try std.testing.expectEqual(@as(u32, 96), buffer.commands[0].index_count);
+}
+
+test "rounded rectangle invalid geometry and capacity are atomic" {
+    var vertices: [17]Vertex = undefined;
+    var indices: [48]u32 = undefined;
+    var commands: [1]Command = undefined;
+    var buffer = Buffer.init(&vertices, &indices, &commands);
+    const region: ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    const radii: CornerRadii = .{ .top_left = 100, .top_right = 100, .bottom_right = 100, .bottom_left = 100 };
+    try std.testing.expectError(error.InvalidGeometry, buffer.addRoundedRect(0, 0, 20, 10, radii, 0, 0, 0, region));
+    try std.testing.expectEqual(@as(usize, 0), buffer.vertex_count);
+    try buffer.addRoundedRect(0, 0, 20, 10, radii, 3, 0, 0, region);
+    try std.testing.expectEqual(@as(usize, 17), buffer.vertex_count);
+    try std.testing.expectError(error.OutOfCapacity, buffer.addRoundedRect(20, 0, 40, 10, radii, 3, 0, 0, region));
+    try std.testing.expectEqual(@as(usize, 17), buffer.vertex_count);
+    try std.testing.expectEqual(@as(usize, 48), buffer.index_count);
+    try std.testing.expectEqual(@as(usize, 1), buffer.command_count);
+}
+
+test "zero radii use rectangle geometry" {
+    var vertices: [4]Vertex = undefined;
+    var indices: [6]u32 = undefined;
+    var commands: [1]Command = undefined;
+    var buffer = Buffer.init(&vertices, &indices, &commands);
+    const region: ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    try buffer.addRoundedRect(0, 0, 20, 10, .{ .top_left = 0, .top_right = 0, .bottom_right = 0, .bottom_left = 0 }, 4, 0, 0, region);
+    try std.testing.expectEqual(@as(usize, 4), buffer.vertex_count);
+    try std.testing.expectEqual(@as(usize, 6), buffer.index_count);
+}
+
+test "draw preflight rejects invalid public counters without writes" {
+    var vertices: [4]Vertex = undefined;
+    var indices: [6]u32 = undefined;
+    var commands: [1]Command = undefined;
+    const region: ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    var buffer = Buffer.init(&vertices, &indices, &commands);
+    buffer.vertex_count = 5;
+    try std.testing.expectError(error.OutOfCapacity, buffer.addRect(0, 0, 1, 1, 0, 0, region));
+    try std.testing.expectEqual(@as(usize, 5), buffer.vertex_count);
+    buffer.vertex_count = 0;
+    buffer.index_count = 7;
+    try std.testing.expectError(error.OutOfCapacity, buffer.addTriangle(.{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, 0, 0, region));
+    buffer.index_count = 0;
+    buffer.command_count = 2;
+    try std.testing.expectError(error.OutOfCapacity, buffer.addCircle(.{ 5, 5 }, 2, 8, 0, 0, region));
+    buffer.command_count = 0;
+    try buffer.addRect(0, 0, 1, 1, 0, 0, region);
+    try std.testing.expectEqual(@as(usize, 1), buffer.command_count);
+}
+
+test "draw preflight rejects inconsistent last command without writes" {
+    var vertices: [8]Vertex = undefined;
+    var indices: [12]u32 = undefined;
+    var commands: [2]Command = undefined;
+    const region: ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    var buffer = Buffer.init(&vertices, &indices, &commands);
+    try buffer.addRect(0, 0, 1, 1, 0, 0, region);
+    buffer.commands[0].index_count = 7;
+    try std.testing.expectError(error.InvalidGeometry, buffer.addRect(1, 0, 2, 1, 0, 0, region));
+    try std.testing.expectEqual(@as(usize, 4), buffer.vertex_count);
+    try std.testing.expectEqual(@as(usize, 6), buffer.index_count);
+    try std.testing.expectEqual(@as(usize, 1), buffer.command_count);
 }

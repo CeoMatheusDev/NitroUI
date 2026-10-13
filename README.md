@@ -1,159 +1,145 @@
-# NitroUI 0.1.0 — milestone 3: persistent memory and overlap validation
+# NitroUI
 
-Engine-first Immediate Mode UI in Zig 0.17.0 (target). No OS, GPU or C dependencies.
+Immediate-mode UI library in native Zig, engine-first and backend-independent.
+100% Zig 0.17.0. No C/C++, no OS/window/input/GPU access, no mandatory
+external dependencies.
 
-## Implemented
+Version: 0.2.0.
 
-- Explicit frame lifecycle: idle → building → ready → idle.
-- Caller-owned, fixed-capacity scratch, render, and persistent byte arenas.
-- Checked non-overlap validation on buffer attachment (transactional on failure).
-- Explicit `OutOfCapacity` and `SizeOverflow`; no heap allocations.
-- Failed reservations leave buffer cursors unchanged.
-- Render storage remains stable during `ready`; next frame is prohibited until release.
-- High-watermark accounting for buffer capacity planning.
+> Native Zig. Engine-First. Performance-Driven.
 
-## Ownership and limitations
+## Responsibilities
 
-The caller owns and retains all attached storage slices for the entire context lifetime (or until buffers are replaced while idle). `setBuffers` and `setPersistentBuffer` reject overlapping regions; callers must still ensure the underlying storage stays alive and stable. Never modify or resize buffers while a frame is active. Scratch and render storage are byte-oriented and do not guarantee typed alignment. These are foundations, **not** a complete typed vertex/index/command buffer API. Persistent byte storage exists, but widget-state indexing and reclamation are not implemented. Buffer capacity is fixed; overflow returns an error instead of allocating.
+| Engine provides | NitroUI provides |
+|---|---|
+| Window, OS, input events, delta time, display size | Frame context, input processing, IDs, persistent state |
+| Textures, renderer, GPU, graphics backend | Layout, widgets, interaction, style, geometry |
+| Caller-owned buffers (all memory) | Draw data (vertices, indices, commands, clips) |
 
-## Integration
+NitroUI never allocates on the hot path: every buffer is caller-owned and
+attached explicitly. No function takes `std.mem.Allocator`.
 
-Copy to `engine/third_party/nitro_ui/`. Integrate its local module via `build.zig`. Provide scratch/render storage with `setBuffers`, and optionally persistent storage with `setPersistentBuffer`, before the first frame. Call `beginFrame`, build (future widgets), `endFrame`, consume render data, then `releaseFrame`.
+## Integration as a local module
 
-## Validation
+Vendor under your engine and add a path dependency:
 
-Run `zig build test` with Zig 0.17.0. The compiler is unavailable in this execution environment; code has **not** been compiler-verified. `build.zig.zon` still contains a provisional fingerprint and needs Zig package-manager validation.
+```zig
+// engine/build.zig.zon
+.dependencies = .{
+    .nitro_ui = .{ .path = "third_party/nitro_ui" },
+},
+```
 
-## Etapa 4 — reservas alinhadas
+```zig
+// engine/build.zig
+const nitro_ui = b.dependency("nitro_ui", .{
+    .target = target,
+    .optimize = optimize,
+});
+mod.addImport("nitro_ui", nitro_ui.module("nitro_ui"));
+```
 
-`ByteArena.reserveAligned(count, alignment)` permite reservar regiões cujo endereço
-inicial é múltiplo de `alignment` (potência de dois, maior que zero). O padding
-necessário consome capacidade; a operação é transacional quando falha.
-O contexto disponibiliza `reserveScratchAligned`, `reserveRenderAligned` e
-`reservePersistentAligned`, exclusivamente durante `building`.
+```zig
+const ui = @import("nitro_ui");
+```
 
-**Validade e ownership:** a engine é proprietária dos três buffers, que não podem
-se sobrepor e devem permanecer vivos enquanto associados ao contexto. Scratch
-pode ser reutilizado em `beginFrame`; render não deve ser acessado após
-`releaseFrame`; persistent permanece reservado até substituição explícita.
-A engine deve concluir qualquer leitura assíncrona (inclusive GPU) antes de
-permitir a reutilização do buffer render. Nenhuma arena inicializa bytes.
+Requires Zig 0.17.0 (`zig version`). Single-threaded; one `Context` per
+instance, no global mutable state.
 
-**Política de capacidade:** fixed-capacity, sem crescimento automático. Falhas
-retornam `OutOfCapacity`; o chamador pode provisionar buffers maiores somente
-quando o contexto estiver `idle`. A substituição invalida slices anteriores.
-Reservas alinhadas retornam `[]u8`; não constituem ainda uma API tipada.
+## Frame cycle
 
-**Validação:** testes foram adicionados, mas a compilação e execução em Zig
-0.17.0 ainda não foram realizadas neste ambiente.
+```zig
+var vertices: [256]ui.draw.Vertex = undefined;
+var indices: [384]u32 = undefined;
+var commands: [16]ui.draw.Command = undefined;
+var ctx: ui.Context = .{};
+try ctx.setGeometryStorage(&vertices, &indices, &commands);
 
-## Milestone 5 — ordered input events (draft)
+var checked: bool = false;
+var volume: f32 = 0.5;
+const region: ui.draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 800, .max_y = 600 };
 
-`src/input.zig` defines OS-independent event variants and a `Processor` with
-continuous pointer/button state and per-frame transitions. The engine supplies
-ordered events via `Context.processEvents()` during `building`. Validation is
-performed before mutation. Input slices remain caller-owned; do not mutate or
-free them while referenced by the context. Multiple batches per frame are
-supported, but each batch replaces the exposed `events` slice; accumulated
-button transitions and wheel deltas remain in `snapshot`.
+try ctx.beginFrame(.{ .delta_seconds = 1.0 / 60.0, .display_size = .{ .x = 800, .y = 600 } });
+try ctx.processEvents(&.{.{ .pointer_move = .{ .x = 40, .y = 30 } }});
+try ctx.pushLayout(.{ .x = 10, .y = 10, .width = 200, .height = 200 }, .{ .x = 0, .y = 6 });
+const b = try ctx.nextLayoutRect(null, 28);
+const c = try ctx.nextLayoutRect(null, 20);
+const s = try ctx.nextLayoutRect(null, 20);
+if (try ctx.button(try ctx.widgetId("play"), b, region)) {}
+_ = try ctx.checkbox(try ctx.widgetId("muted"), c, &checked, region);
+_ = try ctx.sliderFloat(try ctx.widgetId("volume"), s, &volume, 0, 1, region);
+try ctx.popLayout();
+try ctx.endFrame();
 
-**Not yet implemented:** keyboard-held state, text queue persistence across
-batches, event timestamps, pointer capture, and stable widget IDs. Wheel sum
-can overflow `f32` with extremely large finite inputs; avoid interpreting it
-as a validated finite delta until that contract is tightened.
+// Renderer consumes the borrowed view, then the frame is released.
+const view = try ctx.drawDataView();
+// ... submit view.vertices / view.indices / view.commands to the GPU ...
+try ctx.releaseFrame();
+```
 
-**Validation status:** Zig 0.17.0 compiler unavailable in this environment;
-source and tests have not been compiled or executed.
+States: `idle → beginFrame → building → endFrame → ready → releaseFrame → idle`.
+Calls incompatible with the current state return `error.InvalidFrameState`.
+Unbalanced ID scopes, clips or layout regions fail `endFrame()` and keep the
+`building` state so the frame can be finished or abandoned explicitly.
 
-## Milestone 6 — teclado e consistência de input
+## Ownership and slice validity
 
-- Estado de 256 códigos lógicos de tecla (`0...255`), com bitsets para `down`,
-  `pressed` e `released`; os códigos são definidos pela engine, não pelo SO.
-- Transições de mouse/teclado e scroll acumulam entre lotes no mesmo frame;
-  somente `beginFrame` limpa os estados transitórios.
-- Processamento transacional: qualquer evento inválido ou overflow de scroll
-  rejeita o lote completo sem alterar o snapshot ou o último lote aceito.
-- Perda de foco libera teclas e botões pressionados.
-- `Processor.events` referencia **somente o último lote**; para processar texto
-  de múltiplos lotes a engine deve consumir cada lote antes do seguinte.
-- O buffer de eventos continua pertencendo à engine e precisa permanecer válido
-  durante seu consumo. A API de texto agregado ainda está pendente.
+| Data | Owner | Valid |
+|---|---|---|
+| Scratch/persistent/render arenas, state entries, geometry buffers, ID-tracking storage | Engine (attached idle-only, must be pairwise disjoint) | Until replaced/detached |
+| `reserveScratch` slices | Context arena | Until next `beginFrame()` |
+| `reserveRender` slices, `drawDataView()` slices | Context arena / geometry | `ready` only, until `releaseFrame()` |
+| `reservePersistent` slices, `widgetState()` entries | Context arena / state table | Across frames, until storage replaced (`pruneStates` may move entries) |
+| Event batches passed to `processEvents` | Engine | Until next batch or frame release |
 
-A compilação e os testes em Zig 0.17.0 permanecem pendentes de execução.
+`[]const` on the draw view forbids writes through that reference but does not
+remove other mutable aliases: do not mutate or reuse the storage while the
+renderer consumes it. Capacity exhaustion returns `error.OutOfCapacity`
+without partial writes (widgets roll back logically). Calling `widgetState`
+or any `reserve*` before attaching the corresponding storage returns
+`error.MissingStorage` instead.
 
-## Etapa 7 — Identificadores hierárquicos
+## Build, test, benchmark
 
-`src/ids.zig` define `Id = u64` e `Stack` com profundidade máxima de 64
-escopos, sem heap. Usa FNV-1a de 64 bits, com tags de tipo e prefixo de
-comprimento para labels. O hash é determinístico dentro da mesma versão do
-algoritmo, mas **não garante ausência de colisões**; IDs não são serializados
-nem devem ser usados como identificadores persistentes entre versões.
+```sh
+zig version                                   # 0.17.0
+zig fmt build.zig src bench
+zig fmt --check build.zig src bench
+zig build test --summary all                  # 82/82 (Debug and ReleaseFast)
+zig test src/root.zig                         # 82/82
+zig build integration                         # headless engine-side contract (Debug)
+zig build integration -Doptimize=ReleaseFast  # headless engine-side contract
+zig build bench -Doptimize=ReleaseFast
+```
 
-Durante `building`, utilize `ctx.widgetId("nome")`, `ctx.pushId("escopo")`,
-`ctx.pushIdInteger(index)` e `ctx.popId()`. `endFrame()` rejeita escopos
-não balanceados, sem avançar o estado do contexto. `beginFrame()` reinicia
-a pilha na raiz. IDs iguais dentro do mesmo escopo identificam o mesmo widget:
-o chamador deve usar escopos diferentes para instâncias repetidas.
+The headless bench runs deterministic `rect` (geometry only), `widget`
+(input + layout + integer-ID buttons) and `idstr` (hierarchical string IDs)
+cases with 30 warm-up and 300 measured frames, reporting checksums plus
+`ns_frame_min/med/p90/max` and `ns_widget_med`.
+Reference machine-specific medians: ~14ns/widget (`rect`), ~30ns/widget
+(`widget`), ~32ns/widget (`idstr`), linear from 64 to 4096 widgets.
+Your numbers will differ. A steady-state integration test additionally proves
+stable high-watermarks and exact output over 40 mixed frames after warm-up.
 
-Ainda pendente: detecção opcional de colisões em Debug, associação de estado
-persistente a IDs e política de limpeza de estados abandonados.
+## Engine-side integration contract (headless)
 
-## Etapa 8 — Estados persistentes por ID (experimental)
+Run `zig build integration` or `zig build integration -Doptimize=ReleaseFast`.
+`examples/engine_host.zig` is an independent consumer of the public module:
+it simulates an engine supplying input/time/storage and a synchronous renderer
+checking index ranges, clipping, texture handles and frame reuse for 40 frames.
+It does **not** exercise an actual engine or asynchronous GPU submission.
 
-`src/state.zig` implementa tabela hash de capacidade fixa, com sondagem linear,
-entradas `{ id, value: u64, last_seen, occupied }` e armazenamento tipado
-fornecido pela engine. `Context.setStateStorage` configura a tabela em `idle`;
-`Context.widgetState(id)` acessa/cria o estado durante `building`.
-`Context.pruneStates(min_frame)` faz limpeza explícita em `idle`.
+## Limitations (0.2.0)
 
-**Contratos:** não modificar o armazenamento externo enquanto estiver anexado;
-não manter ponteiros para entradas depois de `pruneStates` ou substituição da
-tabela; IDs distintos que colidam no hash da tabela são diferenciados por
-comparação integral de `u64`, mas colisões do próprio gerador de IDs continuam
-possíveis. O valor `u64` é armazenamento bruto; tipagem e ownership de dados
-externos ficam para etapas posteriores. A limpeza pode custar O(capacidade²)
-e não ocorre durante a construção de widgets. Não há crescimento automático.
-
-**Validação:** testes adicionados, ainda não executados com Zig 0.17.0.
-
-## Etapa 9 — geometria experimental
-
-`src/draw.zig` implementa buffers tipados, índices `u32`, vértices `RGBA8`,
-clip rects e agrupamento somente de comandos adjacentes com textura/clip iguais.
-O contexto recebe armazenamento externo via `setGeometryStorage`, constrói
-retângulos via `drawRect` e expõe `drawData` somente no estado `ready`.
-A engine mantém a posse da memória e deve completar o consumo antes de
-`releaseFrame`. Coordenadas em pixels lógicos com origem no canto superior
-esquerdo; UV normalizadas. Textura é um identificador opaco `u64`.
-A ausência de geometria configurada retorna `MissingGeometry` ao consultar
-`drawData` e `OutOfCapacity` ao tentar desenhar. Os buffers de geometria
-são separados da arena de bytes de renderização para preservar alinhamento e
-simplificar ownership. Ainda não há tesselação genérica, clipping de CPU,
-conversão de índices nem integração GPU.
-
-**Validação:** testes foram escritos, mas Zig 0.17.0 não foi executado neste ambiente.
-
-## Etapa 10 — triângulos e consistência de batching
-
-- `draw.Buffer.addTriangle` e `Context.drawTriangle`: triângulos preenchidos, três vértices e três índices.
-- Retângulos e triângulos adjacentes podem compartilhar um comando somente se textura, clipping e sequência de índices forem compatíveis.
-- `Context.drawRect` agora retorna `MissingGeometry` se os buffers não estiverem configurados.
-- A geometria é validada antes de qualquer escrita; falhas não alteram as contagens.
-- Não há implementação de linhas, círculos, arredondamento ou clip stack nesta etapa.
-- **Validação:** testes adicionados, porém não executados; Zig 0.17.0 indisponível neste ambiente.
-
-## Milestone 12 — Geometry extensions (experimental)
-
-- `draw.Buffer.addLine`: thick line as a quad (4 vertices, 6 indices), rejects zero-length and nonfinite geometry.
-- `draw.Buffer.addCircle`: filled triangle fan (segments 3..256), generates `segments + 1` vertices and `3 * segments` indices.
-- `Context.drawLine`, `drawCircle`, `drawLineClipped`, `drawCircleClipped`.
-- Fixed-capacity engine-owned buffers, atomic preflight, adjacent command merging.
-- Clipping is command/scissor based: **geometry is not CPU-clipped**. No visibility culling yet.
-- UVs on circles and lines are placeholders; textured rendering of these primitives is not yet defined.
-- Zig 0.17.0 compile/test remains unverified in this environment.
-
-## GitHub repository setup
-
-This source archive includes `.gitignore`, a GitHub Actions workflow, and
-contribution guidance. See [GITHUB_SETUP.md](GITHUB_SETUP.md) for repository
-creation, first push, CI limitations, package fingerprint, and licensing.
+- Widgets: `button`, `checkbox`, `sliderFloat`; no text/fonts yet.
+- No measured clicks, keyboard/unicode, long/varied string labels, or
+  non-rectangle primitive timing.
+- Zero post-warm-up allocations hold structurally (no allocator parameters)
+  and operationally (stable buffer reuse over 40 mixed frames); heap-counter
+  verification is inapplicable by construction.
+- `examples/engine_host.zig` exercises the engine-side contract headlessly
+  (40 frames, renderer checks, buffer reuse) but consumes synchronously: it
+  does not cover async GPU submission or a real engine.
+- Do not mutate `Context` fields directly; use the API. Do not publish
+  expectations about version 0.2.0 until the criteria in the project stages
+  are demonstrated. See `STAGE*.md` for history.

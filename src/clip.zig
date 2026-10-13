@@ -12,12 +12,12 @@ pub const Stack = struct {
         self.depth = 0;
     }
     pub fn current(self: *const Stack) ?draw.ClipRect {
-        if (self.depth == 0) return null;
+        if (self.depth == 0 or self.depth > capacity) return null;
         return self.items[self.depth - 1];
     }
     pub fn push(self: *Stack, rect: draw.ClipRect) Error!void {
         if (!valid(rect)) return error.InvalidClip;
-        if (self.depth == capacity) return error.StackOverflow;
+        if (self.depth >= capacity) return error.StackOverflow;
         var clipped = rect;
         if (self.current()) |parent| {
             clipped.min_x = @max(rect.min_x, parent.min_x);
@@ -82,4 +82,11 @@ test "invalid pushes are atomic and bounds are checked" {
     try std.testing.expectEqual(Stack.capacity, stack.depth);
     stack.reset();
     try stack.validateBalanced();
+}
+
+test "stage24_8 corrupted depth returns null instead of trapping" {
+    var stack: Stack = .{};
+    stack.depth = Stack.capacity + 10;
+    try std.testing.expect(stack.current() == null);
+    try std.testing.expectError(error.StackOverflow, stack.push(.{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }));
 }
