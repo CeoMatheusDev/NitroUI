@@ -80,7 +80,6 @@ test "overflow does not mutate arena" {
     try testing.expectEqual(@as(usize, 1), arena.used);
 }
 
-
 test "aligned reservations and padding" {
     const testing = std.testing;
     var storage: [96]u8 = undefined;

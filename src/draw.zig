@@ -33,9 +33,15 @@ pub const Buffer = struct {
         self.index_count = 0;
         self.command_count = 0;
     }
-    pub fn vertexSlice(self: *const Buffer) []const Vertex { return self.vertices[0..self.vertex_count]; }
-    pub fn indexSlice(self: *const Buffer) []const u32 { return self.indices[0..self.index_count]; }
-    pub fn commandSlice(self: *const Buffer) []const Command { return self.commands[0..self.command_count]; }
+    pub fn vertexSlice(self: *const Buffer) []const Vertex {
+        return self.vertices[0..self.vertex_count];
+    }
+    pub fn indexSlice(self: *const Buffer) []const u32 {
+        return self.indices[0..self.index_count];
+    }
+    pub fn commandSlice(self: *const Buffer) []const Command {
+        return self.commands[0..self.command_count];
+    }
 
     /// Append one filled triangle. Positions are logical display coordinates.
     /// The entire operation is rejected before writing if capacity is insufficient.
@@ -109,8 +115,11 @@ pub const Buffer = struct {
         for (0..n) |i| {
             const angle = tau * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n));
             self.vertices[self.vertex_count + 1 + i] = .{
-                .x = center[0] + radius * @cos(angle), .y = center[1] + radius * @sin(angle),
-                .u = 0, .v = 0, .color = color,
+                .x = center[0] + radius * @cos(angle),
+                .y = center[1] + radius * @sin(angle),
+                .u = 0,
+                .v = 0,
+                .color = color,
             };
             const offset = self.index_count + i * 3;
             self.indices[offset] = base;
@@ -185,7 +194,9 @@ pub const Buffer = struct {
         }
     }
 };
-fn valid(value: f32) bool { return std.math.isFinite(value); }
+fn valid(value: f32) bool {
+    return std.math.isFinite(value);
+}
 fn validClip(clip: ClipRect) bool {
     return valid(clip.min_x) and valid(clip.min_y) and valid(clip.max_x) and valid(clip.max_y) and
         clip.max_x >= clip.min_x and clip.max_y >= clip.min_y;

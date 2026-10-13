@@ -58,26 +58,40 @@ pub const Context = struct {
         try ensureDisjoint(v, i);
         try ensureDisjoint(v, c);
         try ensureDisjoint(i, c);
-        if (self.scratch) |arena| { try ensureDisjoint(v, arena.storage); try ensureDisjoint(i, arena.storage); try ensureDisjoint(c, arena.storage); }
-        if (self.render) |arena| { try ensureDisjoint(v, arena.storage); try ensureDisjoint(i, arena.storage); try ensureDisjoint(c, arena.storage); }
-        if (self.persistent) |arena| { try ensureDisjoint(v, arena.storage); try ensureDisjoint(i, arena.storage); try ensureDisjoint(c, arena.storage); }
+        if (self.scratch) |arena| {
+            try ensureDisjoint(v, arena.storage);
+            try ensureDisjoint(i, arena.storage);
+            try ensureDisjoint(c, arena.storage);
+        }
+        if (self.render) |arena| {
+            try ensureDisjoint(v, arena.storage);
+            try ensureDisjoint(i, arena.storage);
+            try ensureDisjoint(c, arena.storage);
+        }
+        if (self.persistent) |arena| {
+            try ensureDisjoint(v, arena.storage);
+            try ensureDisjoint(i, arena.storage);
+            try ensureDisjoint(c, arena.storage);
+        }
         if (self.states) |table| {
             const bytes = std.mem.sliceAsBytes(table.entries);
-            try ensureDisjoint(v, bytes); try ensureDisjoint(i, bytes); try ensureDisjoint(c, bytes);
+            try ensureDisjoint(v, bytes);
+            try ensureDisjoint(i, bytes);
+            try ensureDisjoint(c, bytes);
         }
         self.geometry = draw.Buffer.init(vertices, indices, commands);
     }
 
-    pub fn drawRect(self: *Context, x0: f32, y0: f32, x1: f32, y1: f32, color: u32, texture: u64, clip: draw.ClipRect) (Error || draw.Error)!void {
+    pub fn drawRect(self: *Context, x0: f32, y0: f32, x1: f32, y1: f32, color: u32, texture: u64, clip_rect: draw.ClipRect) (Error || draw.Error)!void {
         if (self.state != .building) return error.InvalidFrameState;
-        if (self.geometry) |*buffer| return buffer.addRect(x0, y0, x1, y1, color, texture, clip);
+        if (self.geometry) |*buffer| return buffer.addRect(x0, y0, x1, y1, color, texture, clip_rect);
         return error.MissingGeometry;
     }
 
     /// Append a filled triangle to the current frame.
-    pub fn drawTriangle(self: *Context, a: [2]f32, b: [2]f32, c: [2]f32, color: u32, texture: u64, clip: draw.ClipRect) (Error || draw.Error)!void {
+    pub fn drawTriangle(self: *Context, a: [2]f32, b: [2]f32, c: [2]f32, color: u32, texture: u64, clip_rect: draw.ClipRect) (Error || draw.Error)!void {
         if (self.state != .building) return error.InvalidFrameState;
-        if (self.geometry) |*buffer| return buffer.addTriangle(a, b, c, color, texture, clip);
+        if (self.geometry) |*buffer| return buffer.addTriangle(a, b, c, color, texture, clip_rect);
         return error.MissingGeometry;
     }
 
@@ -176,7 +190,10 @@ pub const Context = struct {
             try ensureDisjoint(scratch_storage, bytes);
             try ensureDisjoint(render_storage, bytes);
         }
-        if (self.geometry) |g| { try ensureGeometryDisjoint(scratch_storage, g); try ensureGeometryDisjoint(render_storage, g); }
+        if (self.geometry) |g| {
+            try ensureGeometryDisjoint(scratch_storage, g);
+            try ensureGeometryDisjoint(render_storage, g);
+        }
         self.scratch = memory.ByteArena.init(scratch_storage);
         self.render = memory.ByteArena.init(render_storage);
     }
@@ -353,7 +370,6 @@ test "invalid frame input leaves context unchanged" {
     }));
 }
 
-
 test "render memory survives until release and ready cannot be overwritten" {
     const testing = @import("std").testing;
     var scratch: [16]u8 = undefined;
@@ -426,7 +442,6 @@ test "persistent mutation rejected while frame is ready" {
     try testing.expectError(error.InvalidFrameState, ctx.reservePersistent(1));
 }
 
-
 test "context aligned reservations preserve frame boundaries" {
     const testing = @import("std").testing;
     var scratch: [128]u8 = undefined;
@@ -454,7 +469,6 @@ test "context aligned reservations preserve frame boundaries" {
     try testing.expectEqual(@as(usize, 0), ctx.scratch.?.used);
 }
 
-
 test "context event processing follows lifecycle" {
     const testing = @import("std").testing;
     var ctx: Context = .{};
@@ -467,7 +481,6 @@ test "context event processing follows lifecycle" {
     try testing.expectError(error.InvalidFrameState, ctx.processEvents(&events));
     try ctx.releaseFrame();
 }
-
 
 test "context IDs are frame-scoped and require balanced pushes" {
     const testing = @import("std").testing;
@@ -511,8 +524,8 @@ test "context draw data is ready-only and resets on next frame" {
     try ctx.setGeometryStorage(&vertices, &indices, &commands);
     const frame: FrameInput = .{ .delta_seconds = 0.016, .display_size = .{ .x = 100, .y = 100 } };
     try ctx.beginFrame(frame);
-    const clip: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
-    try ctx.drawRect(0, 0, 10, 10, 0xffffffff, 0, clip);
+    const clip_rect: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    try ctx.drawRect(0, 0, 10, 10, 0xffffffff, 0, clip_rect);
     try testing.expectError(error.InvalidFrameState, ctx.drawData());
     try ctx.endFrame();
     const data = try ctx.drawData();

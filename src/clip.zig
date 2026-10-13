@@ -8,7 +8,9 @@ pub const Stack = struct {
     items: [capacity]draw.ClipRect = undefined,
     depth: usize = 0,
 
-    pub fn reset(self: *Stack) void { self.depth = 0; }
+    pub fn reset(self: *Stack) void {
+        self.depth = 0;
+    }
     pub fn current(self: *const Stack) ?draw.ClipRect {
         if (self.depth == 0) return null;
         return self.items[self.depth - 1];

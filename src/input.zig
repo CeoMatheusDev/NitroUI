@@ -26,9 +26,9 @@ pub const Snapshot = struct {
     wheel_y: f32 = 0,
     primary_pressed: bool = false,
     primary_released: bool = false,
-    keys_down: KeyBits = [_]u8{0} ** (key_count / 8),
-    keys_pressed: KeyBits = [_]u8{0} ** (key_count / 8),
-    keys_released: KeyBits = [_]u8{0} ** (key_count / 8),
+    keys_down: KeyBits = @splat(0),
+    keys_pressed: KeyBits = @splat(0),
+    keys_released: KeyBits = @splat(0),
 
     pub fn keyDown(self: *const Snapshot, code: Key) bool {
         return bitIsSet(&self.keys_down, code);
@@ -65,8 +65,8 @@ pub const Processor = struct {
         self.snapshot.wheel_y = 0;
         self.snapshot.primary_pressed = false;
         self.snapshot.primary_released = false;
-        self.snapshot.keys_pressed = [_]u8{0} ** (key_count / 8);
-        self.snapshot.keys_released = [_]u8{0} ** (key_count / 8);
+        self.snapshot.keys_pressed = @splat(0);
+        self.snapshot.keys_released = @splat(0);
         self.events = &.{};
     }
 
@@ -81,7 +81,7 @@ pub const Processor = struct {
                     next.pointer_y = p.y;
                 },
                 .pointer_button => |b| {
-                    const mask = @as(u8, 1) << @as(u3, @intCast(@intFromEnum(b.button)));
+                    const mask = @as(u8, 1) << @as(u3, @intCast(@backingInt(b.button)));
                     const was_down = (next.buttons_down & mask) != 0;
                     if (b.down) next.buttons_down |= mask else next.buttons_down &= ~mask;
                     if (b.button == .primary and b.down and !was_down) next.primary_pressed = true;
@@ -121,7 +121,9 @@ pub const Processor = struct {
     }
 };
 
-fn finite(x: f32) bool { return std.math.isFinite(x); }
+fn finite(x: f32) bool {
+    return std.math.isFinite(x);
+}
 
 test "transitions accumulate across batches and reset on frame boundary" {
     var p: Processor = .{};
