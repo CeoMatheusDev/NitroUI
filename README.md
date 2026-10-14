@@ -1,5 +1,7 @@
 # NitroUI
 
+[![CI](https://github.com/CeoMatheusDev/NitroUI/actions/workflows/ci.yml/badge.svg)](https://github.com/CeoMatheusDev/NitroUI/actions/workflows/ci.yml)
+
 Immediate-mode UI library in native Zig, engine-first and backend-independent.
 100% Zig 0.17.0. No C/C++, no OS/window/input/GPU access, no mandatory
 external dependencies.
@@ -131,9 +133,10 @@ It does **not** exercise an actual engine or asynchronous GPU submission.
 
 ## Limitations (0.2.0)
 
-- Widgets: `button`, `checkbox`, `sliderFloat`; no text/fonts yet.
-- No measured clicks, keyboard/unicode, long/varied string labels, or
-  non-rectangle primitive timing.
+- Widgets include `button`, `checkbox`, and `sliderFloat`. The codebase also contains font, text rendering, text editing, and text input modules.
+- Performance measurements do not yet comprehensively cover clicks,
+  keyboard/Unicode input, long or varied string labels, or
+  non-rectangle primitives.
 - Zero post-warm-up allocations hold structurally (no allocator parameters)
   and operationally (stable buffer reuse over 40 mixed frames); heap-counter
   verification is inapplicable by construction.
@@ -146,11 +149,37 @@ It does **not** exercise an actual engine or asynchronous GPU submission.
 
 ## Development after the 0.2.0 baseline
 
-`src/font.zig` (stage 25.1) introduces font and glyph metadata contracts only.
-It does not implement text rendering, text widgets, font rasterization,
-or keyboard input. This development snapshot retains version 0.2.0 until an
-explicit release decision. The stage 25.1 tests have not been executed here.
+Development after the 0.2.0 baseline includes font and glyph metadata,
+UTF-8 text measurement and drawing, text editing, and keyboard-driven text
+input modules. These capabilities are still experimental and do not imply
+complete font rasterization, Unicode coverage, or production-ready text widgets.
+
+The repository retains package version 0.2.0 until an explicit release
+decision. The integrated development snapshot has been validated locally
+with Zig 0.17.0, including builds, tests, headless integration, and benchmark
+execution. Local validation does not establish that GitHub Actions has passed.
 
 CI is configured to check formatting, unit tests in Debug/ReleaseFast,
 headless integration in both modes, and the ReleaseFast benchmark.
 A configured CI job is not evidence that a run passed.
+
+## Documentation
+
+- [Architecture and ownership](docs/architecture.md)
+- [Versioning and releases](docs/versioning.md)
+- [Changelog](CHANGELOG.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security](SECURITY.md)
+
+## Project status
+
+NitroUI is experimental. Its public API may change, and production readiness
+is not guaranteed.
+
+The repository currently retains package version 0.2.0. Development stages
+after the 0.2.0 baseline do not constitute a new published release.
+
+## License
+
+No open-source license has been selected yet. Making a repository public
+does not automatically grant permission to reuse or redistribute its code.
