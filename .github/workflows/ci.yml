@@ -1,4 +1,4 @@
-name: Zig validation
+name: Zig tests
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  validation:
+  test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -18,17 +18,7 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
-      # Verify the validation harness before relying on build results.
-      # This exercises error propagation with a simulated Zig executable;
-      # the following steps use the actual Zig 0.17.0 toolchain.
-      - name: Check validation scripts syntax
-        run: |
-          sh -n tools/validate_zig_017.sh
-          sh -n tools/test_validate_zig_017.sh
-      - name: Test validation harness
-        run: sh tools/test_validate_zig_017.sh
-      - name: Verify compiler version
-        run: test "$(zig version)" = '0.17.0'
-      # Formatting and build steps share the same local/CI validation sequence.
-      - name: Validate NitroUI (format, Debug, ReleaseFast, integration, benchmark)
-        run: sh tools/validate_zig_017.sh
+      - name: Check formatting
+        run: zig fmt --check build.zig src
+      - name: Run unit tests
+        run: zig build test

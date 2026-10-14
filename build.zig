@@ -43,20 +43,6 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("integration", "Run engine-side headless integration contract");
     integration_step.dependOn(&run_integration.step);
 
-    // Full engine-side cycle: text, focus, resize, errors, two contexts.
-    const full_cycle_module = b.createModule(.{
-        .root_source_file = b.path("examples/full_cycle.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "nitro_ui", .module = module }},
-    });
-    const full_cycle_exe = b.addExecutable(.{
-        .name = "full_cycle",
-        .root_module = full_cycle_module,
-    });
-    const run_full_cycle = b.addRunArtifact(full_cycle_exe);
-    integration_step.dependOn(&run_full_cycle.step);
-
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Build and run headless benchmark");
     bench_step.dependOn(&run_bench.step);

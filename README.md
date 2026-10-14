@@ -1,7 +1,5 @@
 # NitroUI
 
-[![CI](https://github.com/CeoMatheusDev/NitroUI/actions/workflows/ci.yml/badge.svg)](https://github.com/CeoMatheusDev/NitroUI/actions/workflows/ci.yml)
-
 Immediate-mode UI library in native Zig, engine-first and backend-independent.
 100% Zig 0.17.0. No C/C++, no OS/window/input/GPU access, no mandatory
 external dependencies.
@@ -105,8 +103,8 @@ or any `reserve*` before attaching the corresponding storage returns
 
 ```sh
 zig version                                   # 0.17.0
-zig fmt build.zig src bench examples
-zig fmt --check build.zig src bench examples
+zig fmt build.zig src bench
+zig fmt --check build.zig src bench
 zig build test --summary all                  # 82/82 (Debug and ReleaseFast)
 zig test src/root.zig                         # 82/82
 zig build integration                         # headless engine-side contract (Debug)
@@ -133,53 +131,15 @@ It does **not** exercise an actual engine or asynchronous GPU submission.
 
 ## Limitations (0.2.0)
 
-- Widgets include `button`, `checkbox`, and `sliderFloat`. The codebase also contains font, text rendering, text editing, and text input modules.
-- Performance measurements do not yet comprehensively cover clicks,
-  keyboard/Unicode input, long or varied string labels, or
-  non-rectangle primitives.
+- Widgets: `button`, `checkbox`, `sliderFloat`; no text/fonts yet.
+- No measured clicks, keyboard/unicode, long/varied string labels, or
+  non-rectangle primitive timing.
 - Zero post-warm-up allocations hold structurally (no allocator parameters)
   and operationally (stable buffer reuse over 40 mixed frames); heap-counter
   verification is inapplicable by construction.
 - `examples/engine_host.zig` exercises the engine-side contract headlessly
   (40 frames, renderer checks, buffer reuse) but consumes synchronously: it
   does not cover async GPU submission or a real engine.
-- Do not mutate `Context` fields directly; use the API.
-- The 0.2.0 tag documents the baseline; development-stage changes must be
-  validated separately before inclusion in a future release. See `STAGE*.md`.
-
-## Development after the 0.2.0 baseline
-
-Development after the 0.2.0 baseline includes font and glyph metadata,
-UTF-8 text measurement and drawing, text editing, and keyboard-driven text
-input modules. These capabilities are still experimental and do not imply
-complete font rasterization, Unicode coverage, or production-ready text widgets.
-
-The repository retains package version 0.2.0 until an explicit release
-decision. The integrated development snapshot has been validated locally
-with Zig 0.17.0, including builds, tests, headless integration, and benchmark
-execution. Local validation does not establish that GitHub Actions has passed.
-
-CI is configured to check formatting, unit tests in Debug/ReleaseFast,
-headless integration in both modes, and the ReleaseFast benchmark.
-A configured CI job is not evidence that a run passed.
-
-## Documentation
-
-- [Architecture and ownership](docs/architecture.md)
-- [Versioning and releases](docs/versioning.md)
-- [Changelog](CHANGELOG.md)
-- [Contributing](CONTRIBUTING.md)
-- [Security](SECURITY.md)
-
-## Project status
-
-NitroUI is experimental. Its public API may change, and production readiness
-is not guaranteed.
-
-The repository currently retains package version 0.2.0. Development stages
-after the 0.2.0 baseline do not constitute a new published release.
-
-## License
-
-No open-source license has been selected yet. Making a repository public
-does not automatically grant permission to reuse or redistribute its code.
+- Do not mutate `Context` fields directly; use the API. Do not publish
+  expectations about version 0.2.0 until the criteria in the project stages
+  are demonstrated. See `STAGE*.md` for history.

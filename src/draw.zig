@@ -256,35 +256,6 @@ pub const Buffer = struct {
         }
     }
 
-    /// Append one textured quad. Positions and UVs are supplied explicitly.
-    /// The operation is atomic: validation/capacity failures perform no writes.
-    pub fn addTexturedQuad(self: *Buffer, positions: [4][2]f32, uvs: [4][2]f32, color: u32, texture: u64, clip: ClipRect) Error!void {
-        if (!validClip(clip)) return error.InvalidClip;
-        for (positions) |point| {
-            if (!valid(point[0]) or !valid(point[1])) return error.InvalidGeometry;
-        }
-        for (uvs) |uv_coord| {
-            if (!valid(uv_coord[0]) or !valid(uv_coord[1])) return error.InvalidGeometry;
-        }
-        try self.preflight(4, 6);
-        const merge = self.canMerge(texture, clip, 6);
-        if (!merge and self.command_count == self.commands.len) return error.OutOfCapacity;
-        const base: u32 = @intCast(self.vertex_count);
-        const first: u32 = @intCast(self.index_count);
-        for (positions, uvs, 0..) |point, uv_coord, i| {
-            self.vertices[self.vertex_count + i] = .{ .x = point[0], .y = point[1], .u = uv_coord[0], .v = uv_coord[1], .color = color };
-        }
-        @memcpy(self.indices[self.index_count..][0..6], &[_]u32{ base, base + 1, base + 2, base, base + 2, base + 3 });
-        self.vertex_count += 4;
-        self.index_count += 6;
-        if (merge) {
-            self.commands[self.command_count - 1].index_count += 6;
-        } else {
-            self.commands[self.command_count] = .{ .first_index = first, .index_count = 6, .texture = texture, .clip = clip };
-            self.command_count += 1;
-        }
-    }
-
     fn addQuad(self: *Buffer, points: [4][2]f32, color: u32, texture: u64, clip: ClipRect) Error!void {
         if (!validClip(clip)) return error.InvalidClip;
         try self.preflight(4, 6);

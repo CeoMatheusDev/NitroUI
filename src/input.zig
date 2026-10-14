@@ -5,14 +5,6 @@ pub const MouseButton = enum(u8) { primary, secondary, middle, auxiliary_1, auxi
 /// Logical key code assigned by the engine. Supported range: 0...255.
 pub const Key = u16;
 pub const key_count: usize = 256;
-/// Engine maps physical keys to these logical navigation codes.
-/// Values are reserved by NitroUI; other codes remain application-defined.
-pub const NavigationKey = struct {
-    pub const enter: Key = 13;
-    pub const space: Key = 32;
-    pub const tab: Key = 9;
-    pub const shift: Key = 16;
-};
 pub const Event = union(enum) {
     pointer_move: struct { x: f32, y: f32 },
     pointer_button: struct { button: MouseButton, down: bool },

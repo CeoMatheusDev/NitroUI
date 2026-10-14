@@ -187,80 +187,8 @@ fn runCase(comptime count: usize, comptime workload: Workload) !void {
     });
 }
 
-// Text benchmark: one ASCII or multibyte Unicode glyph per label. Font and
-// atlas descriptors are engine-owned; fixed geometry buffers are reused.
-// The benchmark measures the full frame + label layout + text emission path.
-const TextCase = enum { ascii, unicode };
-
-fn runTextCase(comptime count: usize, comptime kind: TextCase) !void {
-    const codepoint: u21 = if (kind == .ascii) 'A' else 0x20AC;
-    const sample: []const u8 = if (kind == .ascii) "A" else "€";
-    const glyphs = [_]ui.font.Glyph{.{
-        .codepoint = codepoint,
-        .advance_x = 8,
-        .bearing_x = 0,
-        .bearing_y = 8,
-        .width = 7,
-        .height = 9,
-        .u0 = 0,
-        .v0 = 0,
-        .u1 = 1,
-        .v1 = 1,
-    }};
-    const font: ui.font.Font = .{
-        .glyphs = &glyphs,
-        .texture = 7,
-        .ascent = 8,
-        .descent = -2,
-        .line_gap = 0,
-    };
-    try font.validate();
-    var vertices: [count * 4]ui.draw.Vertex = undefined;
-    var indices: [count * 6]u32 = undefined;
-    var commands: [1]ui.draw.Command = undefined;
-    var ctx: ui.Context = .{};
-    try ctx.setGeometryStorage(&vertices, &indices, &commands);
-    const input: ui.FrameInput = .{
-        .delta_seconds = 1.0 / 60.0,
-        .display_size = .{ .x = 2048, .y = 2048 },
-    };
-    var times: [frames_per_case]u64 = undefined;
-    var checksum: u64 = 0;
-    for (0..warmup_frames + frames_per_case) |frame| {
-        const start = if (frame >= warmup_frames) try monoNanos() else @as(u64, 0);
-        try ctx.beginFrame(input);
-        try ctx.pushLayout(
-            .{ .x = 0, .y = 0, .width = 2048, .height = @as(f32, @floatFromInt(count)) * 10 },
-            .{},
-        );
-        for (0..count) |_| {
-            _ = try ctx.label(font, sample, 1, 0xffffffff, region);
-        }
-        try ctx.popLayout();
-        try ctx.endFrame();
-        const data = try ctx.drawDataView();
-        if (data.vertices.len != count * 4 or data.indices.len != count * 6 or data.commands.len != 1)
-            return error.InvalidBenchmarkOutput;
-        if (data.commands[0].index_count != count * 6 or data.commands[0].texture != font.texture)
-            return error.InvalidBenchmarkOutput;
-        checksum +%= @as(u64, @intCast(data.vertices.len));
-        try ctx.releaseFrame();
-        if (frame >= warmup_frames) {
-            const end = try monoNanos();
-            times[frame - warmup_frames] = end - start;
-        }
-    }
-    sortU64(times[0..]);
-    std.debug.print("case=text_{s} labels={d} frames={d} vertices/frame={d} indices/frame={d} commands/frame=1 checksum={d} ns_frame_min={d} ns_frame_med={d} ns_frame_p90={d} ns_frame_max={d} ns_label_med={d}\n", .{
-        @tagName(kind), count,                      frames_per_case,                 count * 4,                  count * 6,                          checksum,
-        times[0],       times[frames_per_case / 2], times[frames_per_case * 9 / 10], times[frames_per_case - 1], times[frames_per_case / 2] / count,
-    });
-}
-
 pub fn main() !void {
     inline for (counts) |count| try runCase(count, .rect);
     inline for (counts) |count| try runCase(count, .widget);
     inline for (counts) |count| try runCase(count, .idstr);
-    inline for (counts) |count| try runTextCase(count, .ascii);
-    inline for (counts) |count| try runTextCase(count, .unicode);
 }
