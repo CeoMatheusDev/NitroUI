@@ -11,6 +11,8 @@ pub const clip = @import("clip.zig");
 pub const layout = @import("layout.zig");
 pub const interaction = @import("interaction.zig");
 pub const style = @import("style.zig");
+pub const font = @import("font.zig");
+pub const text = @import("text.zig");
 
 pub const FrameState = enum { idle, building, ready };
 
@@ -104,6 +106,13 @@ pub const Context = struct {
     pub fn drawRect(self: *Context, x0: f32, y0: f32, x1: f32, y1: f32, color: u32, texture: u64, clip_rect: draw.ClipRect) (Error || draw.Error)!void {
         if (self.state != .building) return error.InvalidFrameState;
         if (self.geometry) |*buffer| return buffer.addRect(x0, y0, x1, y1, color, texture, clip_rect);
+        return error.MissingGeometry;
+    }
+
+    /// Emit one line of UTF-8 text from a baseline origin using engine-owned font data.
+    pub fn drawTextBaseline(self: *Context, font_data: font.Font, utf8: []const u8, baseline: [2]f32, scale: f32, color: u32, clip_rect: draw.ClipRect) (Error || text.Error || font.Error || draw.Error)!text.Metrics {
+        if (self.state != .building) return error.InvalidFrameState;
+        if (self.geometry) |*buffer| return text.emitBaseline(buffer, font_data, utf8, baseline, scale, color, clip_rect);
         return error.MissingGeometry;
     }
 
@@ -387,14 +396,14 @@ pub const Context = struct {
     }
 
     /// Widget IDs are only valid to request while constructing a frame.
-    pub fn widgetId(self: *const Context, label: []const u8) (Error)!ids.Id {
+    pub fn widgetId(self: *const Context, name: []const u8) (Error)!ids.Id {
         if (self.state != .building) return error.InvalidFrameState;
-        return self.id_stack.idString(label);
+        return self.id_stack.idString(name);
     }
 
-    pub fn pushId(self: *Context, label: []const u8) (Error || ids.Error)!void {
+    pub fn pushId(self: *Context, name: []const u8) (Error || ids.Error)!void {
         if (self.state != .building) return error.InvalidFrameState;
-        try self.id_stack.pushString(label);
+        try self.id_stack.pushString(name);
     }
 
     pub fn pushIdInteger(self: *Context, value: u64) (Error || ids.Error)!void {
@@ -521,6 +530,19 @@ pub const Context = struct {
         const changed = next != value.*;
         value.* = next;
         return changed;
+    }
+
+    /// Non-interactive text line sized by the caller (typically via
+    /// `text.lineBox` + `nextLayoutRect`). Baseline is derived from `rect`
+    /// through `text.baselineInRect`, so horizontal padding baked into
+    /// `rect.x` and the font ascent fully determine the origin. Consumes no
+    /// ID-tracking capacity and touches no interaction state; geometry is
+    /// logically atomic per `text.emitBaseline`. Returns measured metrics.
+    pub fn label(self: *Context, rect: layout.Rect, font_data: font.Font, utf8: []const u8, scale: f32, color: u32, clip_rect: draw.ClipRect) (Error || text.Error || font.Error || draw.Error)!text.Metrics {
+        const checkpoint = try self.checkpointWidget();
+        errdefer self.rollbackWidget(checkpoint);
+        const baseline = try text.baselineInRect(rect, font_data, scale);
+        return self.drawTextBaseline(font_data, utf8, baseline, scale, color, clip_rect);
     }
 
     /// Closes a frame: building -> ready. Requires balanced ID/clip/layout
@@ -1408,4 +1430,172 @@ test "stage24_16 unconfigured storage reports MissingStorage, full reports OutOf
     try t.expectError(error.OutOfCapacity, ctx.widgetState(2));
     try ctx.endFrame();
     try ctx.releaseFrame();
+}
+
+test "stage25_3 context drawTextBaseline lifecycle and atomic rollback" {
+    const t = std.testing;
+    const sample_glyphs = [_]font.Glyph{
+        .{ .codepoint = 65, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
+    };
+    const test_font: font.Font = .{ .glyphs = &sample_glyphs, .texture = 9, .ascent = 8, .descent = -2, .line_gap = 1 };
+    try test_font.validate();
+    const region: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    const frame: FrameInput = .{ .delta_seconds = 0.016, .display_size = .{ .x = 100, .y = 100 } };
+
+    var no_geo: Context = .{};
+    try t.expectError(error.InvalidFrameState, no_geo.drawTextBaseline(test_font, "A", .{ 0, 10 }, 1, 0xffffffff, region));
+    try no_geo.beginFrame(frame);
+    try t.expectError(error.MissingGeometry, no_geo.drawTextBaseline(test_font, "A", .{ 0, 10 }, 1, 0xffffffff, region));
+    try no_geo.endFrame();
+    try no_geo.releaseFrame();
+
+    var vertices: [8]draw.Vertex = undefined;
+    var indices: [12]u32 = undefined;
+    var commands: [2]draw.Command = undefined;
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    try ctx.beginFrame(frame);
+    const m = try ctx.drawTextBaseline(test_font, "A", .{ 0, 10 }, 1, 0xffffffff, region);
+    try t.expectEqual(@as(usize, 1), m.glyph_count);
+    try t.expectError(error.MissingGlyph, ctx.drawTextBaseline(test_font, "B", .{ 0, 10 }, 1, 0xffffffff, region));
+    try t.expectEqual(@as(usize, 4), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 6), ctx.geometry.?.index_count);
+    try t.expectEqual(@as(usize, 1), ctx.geometry.?.command_count);
+    try t.expectError(error.InvalidUtf8, ctx.drawTextBaseline(test_font, "\xFF", .{ 0, 10 }, 1, 0xffffffff, region));
+    try t.expectEqual(@as(usize, 4), ctx.geometry.?.vertex_count);
+    _ = try ctx.drawTextBaseline(test_font, "A", .{ 0, 10 }, 1, 0xffffffff, region);
+    try t.expectEqual(@as(usize, 8), ctx.geometry.?.vertex_count);
+    try ctx.endFrame();
+    const view = try ctx.drawDataView();
+    try t.expectEqual(@as(usize, 8), view.vertices.len);
+    try t.expectError(error.InvalidFrameState, ctx.drawTextBaseline(test_font, "A", .{ 0, 10 }, 1, 0xffffffff, region));
+    try ctx.releaseFrame();
+}
+
+test "stage25_4 context text rows use measured height and ascent baseline" {
+    const t = std.testing;
+    const sample_glyphs = [_]font.Glyph{
+        .{ .codepoint = 65, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
+    };
+    const test_font: font.Font = .{ .glyphs = &sample_glyphs, .texture = 9, .ascent = 8, .descent = -2, .line_gap = 1 };
+    try test_font.validate();
+    const region: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 200 };
+    const frame: FrameInput = .{ .delta_seconds = 0.016, .display_size = .{ .x = 200, .y = 200 } };
+    var vertices: [8]draw.Vertex = undefined;
+    var indices: [12]u32 = undefined;
+    var commands: [2]draw.Command = undefined;
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    try ctx.beginFrame(frame);
+    try ctx.pushLayout(.{ .x = 10, .y = 20, .width = 100, .height = 90 }, .{ .x = 5, .y = 3 });
+    const box = try text.lineBox(test_font, "A", 1);
+    try t.expectEqual(@as(f32, 11), box.height);
+    const row0 = try ctx.nextLayoutRect(null, box.height);
+    const row1 = try ctx.nextLayoutRect(null, box.height);
+    const base0 = try text.baselineInRect(row0, test_font, 1);
+    const base1 = try text.baselineInRect(row1, test_font, 1);
+    _ = try ctx.drawTextBaseline(test_font, "A", base0, 1, 0xffffffff, region);
+    _ = try ctx.drawTextBaseline(test_font, "A", base1, 1, 0xffffffff, region);
+    try ctx.popLayout();
+    try ctx.endFrame();
+    const view = try ctx.drawDataView();
+    try t.expectEqual(@as(usize, 8), view.vertices.len);
+    try t.expectEqual(@as(usize, 1), view.commands.len);
+    try t.expectEqual(@as(f32, 16), view.vertices[0].x);
+    try t.expectEqual(@as(f32, 21), view.vertices[0].y);
+    try t.expectEqual(@as(f32, 35), view.vertices[4].y);
+    try ctx.releaseFrame();
+}
+
+test "stage25_5 label emits text in layout rect without interaction" {
+    const t = std.testing;
+    const sample_glyphs = [_]font.Glyph{
+        .{ .codepoint = 65, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
+        .{ .codepoint = 66, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
+        .{ .codepoint = 0xE9, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
+    };
+    const test_font: font.Font = .{ .glyphs = &sample_glyphs, .texture = 9, .ascent = 8, .descent = -2, .line_gap = 1 };
+    try test_font.validate();
+    const region: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 200 };
+    const frame: FrameInput = .{ .delta_seconds = 0.016, .display_size = .{ .x = 200, .y = 200 } };
+    var vertices: [16]draw.Vertex = undefined;
+    var indices: [24]u32 = undefined;
+    var commands: [4]draw.Command = undefined;
+    var visited: [4]ids.Id = undefined;
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    try ctx.setInteractionIdStorage(&visited);
+    try ctx.beginFrame(frame);
+    try ctx.pushLayout(.{ .x = 10, .y = 20, .width = 100, .height = 90 }, .{ .x = 5, .y = 3 });
+    const box = try text.lineBox(test_font, "AB", 1);
+    const row = try ctx.nextLayoutRect(null, box.height);
+    const m = try ctx.label(row, test_font, "AB", 1, 0xffffffff, region);
+    try t.expectEqual(@as(usize, 2), m.glyph_count);
+    try t.expectEqual(@as(f32, 14), m.advance_x);
+    try t.expectEqual(@as(usize, 8), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 12), ctx.geometry.?.index_count);
+    try t.expectEqual(@as(usize, 1), ctx.geometry.?.command_count);
+    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
+    const uni_row = try ctx.nextLayoutRect(null, box.height);
+    const um = try ctx.label(uni_row, test_font, "A\xC3\xA9", 1, 0xffffffff, region);
+    try t.expectEqual(@as(usize, 2), um.glyph_count);
+    try t.expectEqual(@as(usize, 16), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 1), ctx.geometry.?.command_count);
+    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
+    const empty_row = try ctx.nextLayoutRect(null, box.height);
+    const em = try ctx.label(empty_row, test_font, "", 1, 0xffffffff, region);
+    try t.expectEqual(@as(usize, 0), em.glyph_count);
+    try t.expectEqual(@as(usize, 16), ctx.geometry.?.vertex_count);
+    try ctx.popLayout();
+    try ctx.endFrame();
+    const view = try ctx.drawDataView();
+    try t.expectEqual(@as(usize, 16), view.vertices.len);
+    try ctx.releaseFrame();
+}
+
+test "stage25_5 label failures are atomic and preserve interaction" {
+    const t = std.testing;
+    const sample_glyphs = [_]font.Glyph{
+        .{ .codepoint = 65, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
+    };
+    const test_font: font.Font = .{ .glyphs = &sample_glyphs, .texture = 9, .ascent = 8, .descent = -2, .line_gap = 1 };
+    try test_font.validate();
+    const region: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    const frame: FrameInput = .{ .delta_seconds = 0.016, .display_size = .{ .x = 100, .y = 100 } };
+    var vertices: [8]draw.Vertex = undefined;
+    var indices: [12]u32 = undefined;
+    var commands: [2]draw.Command = undefined;
+    var visited: [4]ids.Id = undefined;
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    try ctx.setInteractionIdStorage(&visited);
+    try t.expectError(error.InvalidFrameState, ctx.label(.{ .x = 0, .y = 0, .width = 50, .height = 11 }, test_font, "A", 1, 0xffffffff, region));
+    try ctx.beginFrame(frame);
+    const rect: layout.Rect = .{ .x = 0, .y = 0, .width = 50, .height = 11 };
+    try t.expectError(error.MissingGlyph, ctx.label(rect, test_font, "B", 1, 0xffffffff, region));
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.vertex_count);
+    try t.expectError(error.InvalidScale, ctx.label(rect, test_font, "A", 0, 0xffffffff, region));
+    try t.expectError(error.InvalidUtf8, ctx.label(rect, test_font, "\xFF", 1, 0xffffffff, region));
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
+    _ = try ctx.label(rect, test_font, "A", 1, 0xffffffff, region);
+    try t.expectEqual(@as(usize, 4), ctx.geometry.?.vertex_count);
+    const before_cmd = ctx.geometry.?.commands[0];
+    const before_interaction = ctx.interaction_state;
+    try t.expectError(error.OutOfCapacity, ctx.label(rect, test_font, "AA", 1, 0xffffffff, region));
+    try t.expectEqual(@as(usize, 4), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 6), ctx.geometry.?.index_count);
+    try t.expectEqual(@as(usize, 1), ctx.geometry.?.command_count);
+    try t.expectEqualDeep(before_cmd, ctx.geometry.?.commands[0]);
+    try t.expectEqualDeep(before_interaction, ctx.interaction_state);
+    _ = try ctx.interact(42, .{ .x = 80, .y = 80, .width = 5, .height = 5 });
+    try t.expectEqual(@as(usize, 1), ctx.interaction_state.visited_count);
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+// Include text/font contract tests in the root test suite.
+test {
+    _ = @import("font.zig");
+    _ = @import("text.zig");
 }
