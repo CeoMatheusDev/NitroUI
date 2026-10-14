@@ -1,60 +1,23 @@
-# Stage 25.3 — Unicode, metrics and fallback
+# Stage 25.3 — Unicode and text emission regression hardening
 
-Development baseline remains 0.2.0; no release/version bump is performed here.
+Baseline: stage 25.2 ZIP, **not** the GitHub `main` branch. Declared version remains `0.2.0`.
 
-## Scope
+## Repository inspection
 
-Hardening of stage 25.2 contracts without new public APIs or layout changes.
-No complex shaping. Newline/multiline policy still deferred: control bytes
-(including `\n`) resolve like any other codepoint.
+GitHub `main` was inspected using the connected GitHub repository interface. It still exposes the 10 pre-font `src` modules and the older CI; `font.zig` and `text.zig` are local-only at the time of this inspection. No remote changes were made.
 
-## Added
+## Changes
 
-- `src/text.zig`: 8 new tests (12 total in file):
-  - UTF-8 scalar boundaries (U+0000..U+10FFFF, D7FF/E000 valid) and lengths.
-  - Rejection of empty, standalone continuations, illegal leads (C1/FE/FF/F5),
-    truncated sequences, bad continuations, overlong 3/4-byte, DFFF surrogate.
-  - Measure edges: empty string (0/0), invalid scales (0/neg/inf/nan),
-    missing glyph without fallback, fallback resolution, 256-glyph long string,
-    scale overflow via huge advance, invalid UTF-8 passthrough.
-  - Zero-area glyph skip: mixed zero/normal "AB" yields 2-count metrics but
-    one quad (4v/6i/1c).
-  - Non-finite baseline (inf/nan) and inf bearing rejected as InvalidPosition
-    with zero geometry drift; buffer remains reusable.
-  - Merged-command rollback: rect + "AA" overflowing restores 4v/6i/1c and the
-    exact prior command; single-glyph retry then merges to 8v/12i.
-  - Command-capacity exhaustion with mismatched texture leaves prior command
-    untouched.
-  - Long-string batching: 256x "A" emits 1024v/1536i/1c with all indices
-    in bounds.
-- `src/root.zig`: 1 new test for `Context.drawTextBaseline`:
-  - Idle call rejected, missing geometry reported, MissingGlyph/InvalidUtf8
-    leave geometry counts unchanged while staying in `building`, retry merges,
-    ready-state call rejected, view verified after `endFrame()`.
+- `src/text.zig`: export the UTF-8 decoder result type (`Decoded`) for its public return contract.
+- `src/text.zig`: validate public geometry counters before reading the previous draw command for rollback, preventing an out-of-bounds read when `command_count` was corrupted.
+- `src/text.zig`: reject non-finite pen positions during text emission.
+- Five additional regression tests: Unicode boundaries and malformed UTF-8; empty/invalid text; rollback of a pre-existing merged command; corrupt public counter; non-finite coordinates.
+- No modifications to `draw.Vertex`, `draw.Command`, or existing public function signatures; no new dependencies or allocations.
 
-## Contracts confirmed
+## Validation and remaining risks
 
-- Empty input measures 0 advance / 0 glyphs; emission writes nothing.
-- `scale <= 0`, non-finite, or overflowed accumulation returns InvalidScale
-  before touching geometry.
-- Missing codepoint without fallback returns MissingGlyph before touching
-  geometry; with fallback the fallback advance/geometry is used.
-- Non-finite baseline or derived quad coordinates return InvalidPosition with
-  full logical rollback (counts + merged command).
-- Capacity failures (vertex/index/command) are logically atomic and restore a
-  previously merged command.
+Static inspection and ZIP integrity checks only. The Zig 0.17.0 compiler is not installed in this execution environment; compilation, formatting and tests **have not been executed**. The expected test count is 94 if all earlier 89 tests are present and discovered, but this is unverified.
 
-## Validation
+The text implementation intentionally does not perform font shaping, bidi, kerning, multiline layout, wrapping or GPU submission. Fonts are borrowed; the caller must validate font data and keep it immutable. Text emission currently performs a measurement pass and an emission pass; this favors logical atomicity over minimum traversal cost. The public draw counters are still mutable by callers, so validation remains important.
 
-- `zig fmt --check build.zig src bench examples`: pass.
-- `zig build test --summary all`: 99/99 pass (Debug).
-- `zig build test -Doptimize=ReleaseFast --summary all`: 99/99 pass.
-- `zig build integration` and `-Doptimize=ReleaseFast`: exit 0.
-- `zig build bench -Doptimize=ReleaseFast`: exit 0, 12 cases unchanged.
-
-## Risks / pending
-
-- Fonts are still caller-validated; unvalidated metrics (inf bearing/advance)
-  are rejected per-call but not cached.
-- No horizontal layout, label widget, or text benchmark yet (stages 25.4-25.6).
-- No real-engine or async-GPU validation; headless sync consumption only.
+Next: run Zig 0.17.0 Debug/ReleaseFast test matrix and integration on Fedora; fix failures before 25.4 layout integration. Do not publish v0.3.0 or change remote without authorization.

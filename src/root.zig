@@ -13,6 +13,8 @@ pub const interaction = @import("interaction.zig");
 pub const style = @import("style.zig");
 pub const font = @import("font.zig");
 pub const text = @import("text.zig");
+pub const text_edit = @import("text_edit.zig");
+pub const text_input = @import("text_input.zig");
 
 pub const FrameState = enum { idle, building, ready };
 
@@ -378,9 +380,57 @@ pub const Context = struct {
         try self.layout_stack.push(bounds, spacing);
     }
 
+    /// Begin a horizontal layout region; child items require explicit widths.
+    pub fn pushHorizontalLayout(self: *Context, bounds: layout.Rect, spacing: layout.Spacing) (Error || layout.Error)!void {
+        if (self.state != .building) return error.InvalidFrameState;
+        try self.layout_stack.pushHorizontal(bounds, spacing);
+    }
+
     pub fn nextLayoutRect(self: *Context, width: ?f32, height: f32) (Error || layout.Error)!layout.Rect {
         if (self.state != .building) return error.InvalidFrameState;
         return self.layout_stack.next(width, height);
+    }
+
+    /// Reserve a rectangle with cross-axis alignment in the active region.
+    pub fn nextAlignedLayoutRect(self: *Context, width: ?f32, height: f32, alignment: layout.Alignment) (Error || layout.Error)!layout.Rect {
+        if (self.state != .building) return error.InvalidFrameState;
+        return self.layout_stack.nextAligned(width, height, alignment);
+    }
+
+    /// Fill the remaining main-axis space of the current layout region.
+    /// Cross-axis extent is explicit; no implicit resizing of prior items.
+    pub fn nextFillRemainingLayoutRect(self: *Context, cross_size: f32) (Error || layout.Error)!layout.Rect {
+        if (self.state != .building) return error.InvalidFrameState;
+        return self.layout_stack.nextFillRemaining(cross_size);
+    }
+
+    /// Reserve a proportional share of remaining space without sibling reflow.
+    /// `future_items` reserves spacing for every subsequent sibling.
+    pub fn nextWeightedLayoutRect(self: *Context, weight: f32, remaining_weight: f32, future_items: usize, cross_size: f32) (Error || layout.Error)!layout.Rect {
+        if (self.state != .building) return error.InvalidFrameState;
+        return self.layout_stack.nextWeighted(weight, remaining_weight, future_items, cross_size);
+    }
+
+    /// Reserve one line using font metrics; no geometry is emitted.
+    /// Baseline for drawTextBaseline: .{ rect.x, rect.y + font_data.ascent * scale }.
+    pub fn nextTextLayoutRect(self: *Context, font_data: font.Font, utf8: []const u8, scale: f32) (Error || layout.Error || text.Error || font.Error)!layout.Rect {
+        if (self.state != .building) return error.InvalidFrameState;
+        return self.layout_stack.nextText(font_data, utf8, scale);
+    }
+
+    /// Place and render a single-line, non-interactive label in the current layout.
+    /// The engine owns the font glyphs and atlas texture. No ID or widget state is used.
+    /// On error both layout advancement and visible draw counts are preserved.
+    pub fn label(self: *Context, font_data: font.Font, utf8: []const u8, scale: f32, color: u32, clip_rect: draw.ClipRect) (Error || layout.Error || text.Error || font.Error || draw.Error)!layout.Rect {
+        if (self.state != .building) return error.InvalidFrameState;
+        if (self.geometry == null) return error.MissingGeometry;
+        const previous_layout = self.layout_stack;
+        errdefer self.layout_stack = previous_layout;
+        const rect = try self.layout_stack.nextText(font_data, utf8, scale);
+        const baseline_y = rect.y + font_data.ascent * scale;
+        if (!std.math.isFinite(baseline_y)) return error.CoordinateOverflow;
+        _ = try self.drawTextBaseline(font_data, utf8, .{ rect.x, baseline_y }, scale, color, clip_rect);
+        return rect;
     }
 
     pub fn popLayout(self: *Context) (Error || layout.Error)!void {
@@ -396,14 +446,14 @@ pub const Context = struct {
     }
 
     /// Widget IDs are only valid to request while constructing a frame.
-    pub fn widgetId(self: *const Context, name: []const u8) (Error)!ids.Id {
+    pub fn widgetId(self: *const Context, widget_label: []const u8) (Error)!ids.Id {
         if (self.state != .building) return error.InvalidFrameState;
-        return self.id_stack.idString(name);
+        return self.id_stack.idString(widget_label);
     }
 
-    pub fn pushId(self: *Context, name: []const u8) (Error || ids.Error)!void {
+    pub fn pushId(self: *Context, widget_label: []const u8) (Error || ids.Error)!void {
         if (self.state != .building) return error.InvalidFrameState;
-        try self.id_stack.pushString(name);
+        try self.id_stack.pushString(widget_label);
     }
 
     pub fn pushIdInteger(self: *Context, value: u64) (Error || ids.Error)!void {
@@ -420,6 +470,25 @@ pub const Context = struct {
     pub fn interact(self: *Context, id: ids.Id, rect: layout.Rect) (Error || interaction.Error)!interaction.Result {
         if (self.state != .building) return error.InvalidFrameState;
         return self.interaction_state.item(id, rect, self.input_processor.snapshot);
+    }
+
+    /// Submit a widget with explicit keyboard/pointer eligibility.
+    /// Disabled items are excluded from navigation but remain ID-trackable.
+    pub fn interactEnabled(self: *Context, id: ids.Id, rect: layout.Rect, enabled: bool) (Error || interaction.Error)!interaction.Result {
+        if (self.state != .building) return error.InvalidFrameState;
+        return self.interaction_state.itemEnabled(id, rect, self.input_processor.snapshot, enabled);
+    }
+
+    /// Request keyboard focus for an item that will be submitted in this frame.
+    /// Focus is discarded at endFrame if that item was not submitted.
+    pub fn requestFocus(self: *Context, id: ids.Id) (Error || interaction.Error)!void {
+        if (self.state != .building) return error.InvalidFrameState;
+        try self.interaction_state.requestFocus(id);
+    }
+
+    /// Query the current keyboard focus without modifying state.
+    pub fn focusedId(self: *const Context) ?ids.Id {
+        return self.interaction_state.focused_id;
     }
 
     /// Enable optional per-frame duplicate-ID diagnostics using engine-owned storage.
@@ -443,6 +512,31 @@ pub const Context = struct {
         try self.interaction_state.setIdTrackingStorage(storage);
     }
 
+    /// Configure caller-owned navigation history and current-frame order.
+    /// Both buffers must be disjoint from one another and all attached storage.
+    pub fn setNavigationStorage(self: *Context, previous: ?[]ids.Id, current: ?[]ids.Id) (Error || interaction.Error)!void {
+        if (self.state != .idle) return error.InvalidFrameState;
+        if ((previous == null) != (current == null)) return error.NavigationCapacity;
+        if (previous) |p| {
+            const a = std.mem.sliceAsBytes(p);
+            const b = std.mem.sliceAsBytes(current.?);
+            if (p.len == 0 or current.?.len == 0) return error.NavigationCapacity;
+            try ensureDisjoint(a, b);
+            for ([_][]const u8{ a, b }) |bytes| {
+                if (self.scratch) |arena| try ensureDisjoint(bytes, arena.storage);
+                if (self.render) |arena| try ensureDisjoint(bytes, arena.storage);
+                if (self.persistent) |arena| try ensureDisjoint(bytes, arena.storage);
+                if (self.states) |table| {
+                    const state_bytes = @as([*]const u8, @ptrCast(table.entries.ptr))[0 .. table.entries.len * @sizeOf(widget_state.Entry)];
+                    try ensureDisjoint(bytes, state_bytes);
+                }
+                if (self.geometry) |g| try ensureGeometryDisjoint(bytes, g);
+                if (self.interaction_state.visited_ids) |tracked| try ensureDisjoint(bytes, std.mem.sliceAsBytes(tracked));
+            }
+        }
+        try self.interaction_state.setNavigationStorage(previous, current);
+    }
+
     /// Change the per-context style outside frame construction. No allocation.
     pub fn setStyle(self: *Context, new_style: style.Style) error{ InvalidFrameState, InvalidStyle }!void {
         if (self.state != .idle) return error.InvalidFrameState;
@@ -459,9 +553,15 @@ pub const Context = struct {
         last_command: ?draw.Command,
     };
 
-    fn checkpointWidget(self: *Context) Error!WidgetCheckpoint {
+    fn checkpointWidget(self: *Context) (Error || draw.Error)!WidgetCheckpoint {
         if (self.state != .building) return error.InvalidFrameState;
         const buffer = self.geometry orelse return error.MissingGeometry;
+        // Context exposes geometry publicly. Reject invalid logical prefixes
+        // before a widget can read the previous draw command or emit data.
+        if (buffer.vertex_count > buffer.vertices.len or
+            buffer.index_count > buffer.indices.len or
+            buffer.command_count > buffer.commands.len)
+            return error.OutOfCapacity;
         return .{
             .geometry = buffer,
             .interaction_state = self.interaction_state,
@@ -488,7 +588,225 @@ pub const Context = struct {
         const result = try self.interact(id, rect);
         const color: u32 = if (result.held) self.visual_style.colors.button_active else if (result.hovered) self.visual_style.colors.button_hovered else self.visual_style.colors.button;
         try self.drawRect(rect.x, rect.y, rect.x + rect.width, rect.y + rect.height, color, 0, clip_rect);
-        return result.clicked;
+        const keyboard_clicked = try self.interaction_state.keyboardActivate(id, self.input_processor.snapshot);
+        return result.clicked or keyboard_clicked;
+    }
+
+    /// Button with centered single-line UTF-8 caption. The caller owns the font,
+    /// atlas, ID and bounds. Uses the same interaction path as button().
+    /// On error restores pointer capture and logical geometry counts.
+    pub fn buttonText(self: *Context, id: ids.Id, rect: layout.Rect, caption: []const u8, font_data: font.Font, scale: f32, text_color: u32, clip_rect: draw.ClipRect) (Error || interaction.Error || draw.Error || text.Error || font.Error)!bool {
+        const checkpoint = try self.checkpointWidget();
+        errdefer self.rollbackWidget(checkpoint);
+
+        // Reject malformed text before claiming the widget ID or pointer capture.
+        const metrics = try text.measure(font_data, caption, scale);
+        const line_height = (font_data.ascent - font_data.descent + font_data.line_gap) * scale;
+        if (!std.math.isFinite(line_height) or line_height <= 0) return error.InvalidScale;
+        const baseline_x = rect.x + (rect.width - metrics.advance_x) * 0.5;
+        const baseline_y = rect.y + (rect.height - line_height) * 0.5 + font_data.ascent * scale;
+        if (!std.math.isFinite(baseline_x) or !std.math.isFinite(baseline_y)) return error.InvalidPosition;
+
+        const result = try self.interact(id, rect);
+        const color: u32 = if (result.held) self.visual_style.colors.button_active else if (result.hovered) self.visual_style.colors.button_hovered else self.visual_style.colors.button;
+        try self.drawRect(rect.x, rect.y, rect.x + rect.width, rect.y + rect.height, color, 0, clip_rect);
+        _ = try self.drawTextBaseline(font_data, caption, .{ baseline_x, baseline_y }, scale, text_color, clip_rect);
+        const keyboard_clicked = try self.interaction_state.keyboardActivate(id, self.input_processor.snapshot);
+        return result.clicked or keyboard_clicked;
+    }
+
+    /// Clip a single-line field to its content area, preserving the caller clip.
+    /// An empty intersection is represented by a zero-area clip rectangle.
+    fn inputTextContentClip(rect: layout.Rect, padding_x: f32, outer: draw.ClipRect) draw.Error!draw.ClipRect {
+        if (!std.math.isFinite(outer.min_x) or !std.math.isFinite(outer.min_y) or
+            !std.math.isFinite(outer.max_x) or !std.math.isFinite(outer.max_y) or
+            outer.max_x < outer.min_x or outer.max_y < outer.min_y) return error.InvalidClip;
+        if (!std.math.isFinite(rect.x) or !std.math.isFinite(rect.y) or
+            !std.math.isFinite(rect.width) or !std.math.isFinite(rect.height) or
+            !std.math.isFinite(padding_x) or padding_x < 0 or
+            rect.width < 0 or rect.height < 0) return error.InvalidGeometry;
+        const left = rect.x + padding_x;
+        const right = rect.x + rect.width - padding_x;
+        const bottom = rect.y + rect.height;
+        if (!std.math.isFinite(left) or !std.math.isFinite(right) or !std.math.isFinite(bottom)) return error.InvalidGeometry;
+        const min_x = @max(outer.min_x, left);
+        const min_y = @max(outer.min_y, rect.y);
+        const max_x = @max(min_x, @min(outer.max_x, right));
+        const max_y = @max(min_y, @min(outer.max_y, bottom));
+        return .{ .min_x = min_x, .min_y = min_y, .max_x = max_x, .max_y = max_y };
+    }
+
+    /// Horizontal offset in text pixels. The caller persists the value across frames.
+    /// The caret is kept inside the content viewport; the offset is never negative.
+    fn inputTextScrollOffset(previous: f32, caret_advance: f32, content_width: f32) text.Error!f32 {
+        if (!std.math.isFinite(previous) or previous < 0 or
+            !std.math.isFinite(caret_advance) or caret_advance < 0 or
+            !std.math.isFinite(content_width) or content_width < 0) return error.InvalidPosition;
+        if (content_width == 0) return caret_advance;
+        const right = previous + content_width;
+        if (!std.math.isFinite(right)) return error.InvalidPosition;
+        if (caret_advance < previous) return caret_advance;
+        if (caret_advance > right) return caret_advance - content_width;
+        return previous;
+    }
+
+    /// Advances horizontal scroll while a captured pointer is outside the
+    /// content viewport. Caller supplies the engine delta time; the rate is
+    /// bounded and independent of frame frequency. No allocations.
+    fn inputTextDragAutoScroll(previous: f32, pointer_x: f32, left: f32, right: f32, delta_seconds: f32) text.Error!f32 {
+        if (!std.math.isFinite(previous) or previous < 0 or
+            !std.math.isFinite(pointer_x) or !std.math.isFinite(left) or
+            !std.math.isFinite(right) or right < left or
+            !std.math.isFinite(delta_seconds) or delta_seconds < 0)
+            return error.InvalidPosition;
+        if (delta_seconds == 0 or left == right) return previous;
+        const overflow: f32 = if (pointer_x < left) pointer_x - left else if (pointer_x > right) pointer_x - right else 0;
+        if (overflow == 0) return previous;
+        // Cap velocity and elapsed time to avoid jumps after long pauses.
+        const speed = @min(@abs(overflow) * 8.0 + 80.0, 1200.0);
+        const step = speed * @min(delta_seconds, 0.1);
+        const result = if (overflow < 0) @max(0.0, previous - step) else previous + step;
+        if (!std.math.isFinite(result)) return error.InvalidPosition;
+        return result;
+    }
+
+    /// Failure policy for editable widgets: successful edits to caller-owned
+    /// text are retained if later geometry emission fails. Only NitroUI-owned
+    /// geometry/interaction checkpoints are rolled back. The engine MUST NOT
+    /// replay already-applied input events after a rendering error. Use
+    /// inputTextDraggedTracked to observe the consumed prefix even when the
+    /// visual widget returns an error; the untracked variants do not expose it.
+    /// This policy avoids copying the entire caller-owned text buffer per frame.
+    pub const TextRenderFailurePolicy = enum { retain_edits };
+    pub const text_render_failure_policy: TextRenderFailurePolicy = .retain_edits;
+
+    /// Initial single-line UTF-8 field. Events must be supplied in order by the
+    /// engine, not reconstructed from the last Processor batch. The caller owns
+    /// editor storage and keeps it alive across frames. This first visual pass
+    /// uses temporary horizontal scrolling; use inputTextScrolled to persist it.
+    /// Text edits can persist if a subsequent geometry emission fails.
+    pub fn inputText(self: *Context, id: ids.Id, rect: layout.Rect, editor: *text_edit.Buffer, events: []const input_events.Event, initial_shift: bool, font_data: font.Font, scale: f32, text_color: u32, clip_rect: draw.ClipRect) (Error || interaction.Error || draw.Error || text.Error || font.Error || text_edit.Error)!usize {
+        var temporary_scroll: f32 = 0;
+        return self.inputTextScrolled(id, rect, editor, events, initial_shift, font_data, scale, text_color, clip_rect, &temporary_scroll);
+    }
+
+    /// Scrolling variant of inputText. `horizontal_scroll` is caller-owned,
+    /// persistent between frames, and committed only after geometry succeeds.
+    /// The scroll offset is expressed in the same pixels as text metrics.
+    pub fn inputTextScrolled(self: *Context, id: ids.Id, rect: layout.Rect, editor: *text_edit.Buffer, events: []const input_events.Event, initial_shift: bool, font_data: font.Font, scale: f32, text_color: u32, clip_rect: draw.ClipRect, horizontal_scroll: *f32) (Error || interaction.Error || draw.Error || text.Error || font.Error || text_edit.Error)!usize {
+        return self.inputTextDraggedInternal(id, rect, editor, events, initial_shift, font_data, scale, text_color, clip_rect, horizontal_scroll, null);
+    }
+
+    /// Drag-selection variant. `drag_anchor` is caller-owned persistent state;
+    /// keep it between frames and initialize it to null. Only the primary
+    /// pointer capture belonging to this widget updates the selection.
+    pub fn inputTextDragged(self: *Context, id: ids.Id, rect: layout.Rect, editor: *text_edit.Buffer, events: []const input_events.Event, initial_shift: bool, font_data: font.Font, scale: f32, text_color: u32, clip_rect: draw.ClipRect, horizontal_scroll: *f32, drag_anchor: *?usize) (Error || interaction.Error || draw.Error || text.Error || font.Error || text_edit.Error)!usize {
+        return self.inputTextDraggedInternal(id, rect, editor, events, initial_shift, font_data, scale, text_color, clip_rect, horizontal_scroll, drag_anchor);
+    }
+
+    /// Tracked variant for applications that must recover from partial event
+    /// processing or a subsequent rendering failure. `progress` is reset at
+    /// entry. It counts only events applied by the text-input bridge, not
+    /// pointer interactions. On draw failure, already-consumed events remain
+    /// applied and MUST NOT be replayed. No allocations or text copies.
+    pub fn inputTextDraggedTracked(self: *Context, id: ids.Id, rect: layout.Rect, editor: *text_edit.Buffer, events: []const input_events.Event, initial_shift: bool, font_data: font.Font, scale: f32, text_color: u32, clip_rect: draw.ClipRect, horizontal_scroll: *f32, drag_anchor: *?usize, progress: *text_input.Progress) (Error || interaction.Error || draw.Error || text.Error || font.Error || text_edit.Error)!usize {
+        progress.* = .{ .shift = initial_shift, .focused = false };
+        return self.inputTextDraggedInternalTracked(id, rect, editor, events, initial_shift, font_data, scale, text_color, clip_rect, horizontal_scroll, drag_anchor, progress);
+    }
+
+    fn inputTextDraggedInternal(self: *Context, id: ids.Id, rect: layout.Rect, editor: *text_edit.Buffer, events: []const input_events.Event, initial_shift: bool, font_data: font.Font, scale: f32, text_color: u32, clip_rect: draw.ClipRect, horizontal_scroll: *f32, drag_anchor: ?*?usize) (Error || interaction.Error || draw.Error || text.Error || font.Error || text_edit.Error)!usize {
+        var progress: text_input.Progress = .{};
+        return self.inputTextDraggedInternalTracked(id, rect, editor, events, initial_shift, font_data, scale, text_color, clip_rect, horizontal_scroll, drag_anchor, &progress);
+    }
+
+    fn inputTextDraggedInternalTracked(self: *Context, id: ids.Id, rect: layout.Rect, editor: *text_edit.Buffer, events: []const input_events.Event, initial_shift: bool, font_data: font.Font, scale: f32, text_color: u32, clip_rect: draw.ClipRect, horizontal_scroll: *f32, drag_anchor: ?*?usize, progress: *text_input.Progress) (Error || interaction.Error || draw.Error || text.Error || font.Error || text_edit.Error)!usize {
+        progress.* = .{ .shift = initial_shift, .focused = false };
+        const checkpoint = try self.checkpointWidget();
+        errdefer self.rollbackWidget(checkpoint);
+
+        // Reject externally invalidated cursor/selection and scroll before
+        // claiming interaction or changing caller-owned edit state.
+        try editor.validateState();
+        if (!std.math.isFinite(horizontal_scroll.*) or horizontal_scroll.* < 0) return error.InvalidPosition;
+        // Validate the existing text and geometry before claiming interaction.
+        _ = try text.measure(font_data, editor.view(), scale);
+        const line_height = (font_data.ascent - font_data.descent + font_data.line_gap) * scale;
+        if (!std.math.isFinite(line_height) or line_height <= 0) return error.InvalidScale;
+        if (!std.math.isFinite(rect.x) or !std.math.isFinite(rect.y) or !std.math.isFinite(rect.width) or !std.math.isFinite(rect.height)) return error.InvalidPosition;
+        const baseline_x = rect.x + self.visual_style.frame_padding_x;
+        const baseline_y = rect.y + (rect.height - line_height) * 0.5 + font_data.ascent * scale;
+        if (!std.math.isFinite(baseline_x) or !std.math.isFinite(baseline_y)) return error.InvalidPosition;
+
+        const content_clip = try inputTextContentClip(rect, self.visual_style.frame_padding_x, clip_rect);
+        const result = try self.interact(id, rect);
+        // A failed widget rolls back its interaction checkpoint. Invalidate the
+        // caller-owned drag anchor as well: the restored capture state cannot
+        // safely justify continuing an in-progress drag on the next frame.
+        // Preflight failures above deliberately leave the anchor untouched.
+        errdefer {
+            if (drag_anchor) |anchor| anchor.* = null;
+        }
+        // Pointer-down places the caret at the nearest UTF-8 scalar boundary.
+        // The hit test uses the previous scroll offset, before keyboard edits
+        // and before the next scroll position is calculated.
+        // A drag is valid only while this widget owns primary capture and the
+        // window remains focused. Clear stale anchors before hit testing, so a
+        // release outside the widget or a focus loss cannot resume an old drag.
+        if (drag_anchor) |anchor| {
+            if (!dragCaptureValid(self.interaction_state.active_id, id, self.input_processor.snapshot, result)) {
+                anchor.* = null;
+            }
+        }
+        var drag_scroll = horizontal_scroll.*;
+        const dragging = drag_anchor != null and result.held and drag_anchor.?.* != null and !result.pressed;
+        if (dragging) {
+            const dt: f32 = if (self.input) |frame| frame.delta_seconds else 0;
+            drag_scroll = try inputTextDragAutoScroll(
+                horizontal_scroll.*,
+                self.input_processor.snapshot.pointer_x,
+                content_clip.min_x,
+                content_clip.max_x,
+                dt,
+            );
+        }
+        if (result.pressed or dragging) {
+            const local_x = self.input_processor.snapshot.pointer_x - baseline_x + drag_scroll;
+            const offset = try text.caretOffsetAtX(font_data, editor.view(), scale, local_x);
+            if (result.pressed) {
+                try editor.setCursor(offset);
+                if (drag_anchor) |anchor| anchor.* = offset;
+            } else if (drag_anchor) |anchor| {
+                try editor.select(anchor.*.?, offset);
+            }
+        }
+        const focused = self.focusedId() != null and self.focusedId().? == id and self.input_processor.snapshot.focused;
+        try text_input.applyTracked(editor, events, initial_shift, focused, progress);
+        const changes = progress.changes;
+        const content = editor.view();
+        const metrics = try text.measure(font_data, content, scale);
+        const caret_metrics = try text.measure(font_data, content[0..editor.cursor], scale);
+        const viewport_width = content_clip.max_x - content_clip.min_x;
+        const next_scroll = try inputTextScrollOffset(drag_scroll, caret_metrics.advance_x, viewport_width);
+        const text_x = baseline_x - next_scroll;
+        if (!std.math.isFinite(text_x)) return error.InvalidPosition;
+        const color: u32 = if (focused) self.visual_style.colors.button_active else if (result.hovered) self.visual_style.colors.button_hovered else self.visual_style.colors.button;
+        try self.drawRect(rect.x, rect.y, rect.x + rect.width, rect.y + rect.height, color, 0, clip_rect);
+
+        if (focused) {
+            if (editor.selection()) |range| {
+                const before = try text.measure(font_data, content[0..range.start], scale);
+                const selected = try text.measure(font_data, content[0..range.end], scale);
+                try self.drawRect(text_x + before.advance_x, baseline_y - font_data.ascent * scale, text_x + selected.advance_x, baseline_y - font_data.descent * scale, 0xff986f42, 0, content_clip);
+            }
+        }
+        _ = metrics;
+        _ = try self.drawTextBaseline(font_data, content, .{ text_x, baseline_y }, scale, text_color, content_clip);
+        if (focused) {
+            const caret_x = text_x + caret_metrics.advance_x;
+            try self.drawRect(caret_x, baseline_y - font_data.ascent * scale, caret_x + 1, baseline_y - font_data.descent * scale, text_color, 0, content_clip);
+        }
+        horizontal_scroll.* = next_scroll;
+        return changes;
     }
 
     /// Checkbox value is caller-owned. A successful click toggles it once.
@@ -503,6 +821,47 @@ pub const Context = struct {
             try self.drawRect(rect.x + inset, rect.y + inset, rect.x + rect.width - inset, rect.y + rect.height - inset, self.visual_style.colors.checkmark, 0, clip_rect);
         }
         if (result.clicked) value.* = !value.*;
+        return result.clicked;
+    }
+
+    /// Checkbox with a single-line UTF-8 caption. The full row is interactive;
+    /// the square indicator is placed on the left and vertically centered.
+    /// `value` is committed only after all geometry has been emitted successfully.
+    /// Caller owns the font, atlas, ID, bounds, and boolean storage.
+    pub fn checkboxText(self: *Context, id: ids.Id, rect: layout.Rect, value: *bool, caption: []const u8, font_data: font.Font, scale: f32, text_color: u32, clip_rect: draw.ClipRect) (Error || interaction.Error || draw.Error || text.Error || font.Error)!bool {
+        const checkpoint = try self.checkpointWidget();
+        errdefer self.rollbackWidget(checkpoint);
+
+        const metrics = try text.measure(font_data, caption, scale);
+        const line_height = (font_data.ascent - font_data.descent + font_data.line_gap) * scale;
+        if (!std.math.isFinite(line_height) or line_height <= 0) return error.InvalidScale;
+        if (!std.math.isFinite(rect.x) or !std.math.isFinite(rect.y) or
+            !std.math.isFinite(rect.width) or !std.math.isFinite(rect.height) or
+            rect.width <= 0 or rect.height <= 0) return error.InvalidGeometry;
+
+        const box_size = @min(rect.height, line_height);
+        const gap = box_size * 0.25;
+        const box_x = rect.x;
+        const box_y = rect.y + (rect.height - box_size) * 0.5;
+        const text_x = rect.x + box_size + gap;
+        const baseline_y = rect.y + (rect.height - line_height) * 0.5 + font_data.ascent * scale;
+        if (!std.math.isFinite(box_y) or !std.math.isFinite(text_x) or
+            !std.math.isFinite(baseline_y) or
+            !std.math.isFinite(text_x + metrics.advance_x) or
+            !std.math.isFinite(box_x + box_size) or !std.math.isFinite(box_y + box_size)) return error.InvalidPosition;
+
+        const result = try self.interact(id, rect);
+        const color: u32 = if (result.hovered) self.visual_style.colors.checkbox_hovered else self.visual_style.colors.checkbox;
+        try self.drawRect(box_x, box_y, box_x + box_size, box_y + box_size, color, 0, clip_rect);
+        // Render the state that will be committed on success, without modifying
+        // caller-owned data before all fallible draw operations complete.
+        const next_value = if (result.clicked) !value.* else value.*;
+        if (next_value) {
+            const inset = box_size * 0.25;
+            try self.drawRect(box_x + inset, box_y + inset, box_x + box_size - inset, box_y + box_size - inset, self.visual_style.colors.checkmark, 0, clip_rect);
+        }
+        _ = try self.drawTextBaseline(font_data, caption, .{ text_x, baseline_y }, scale, text_color, clip_rect);
+        value.* = next_value;
         return result.clicked;
     }
 
@@ -532,17 +891,45 @@ pub const Context = struct {
         return changed;
     }
 
-    /// Non-interactive text line sized by the caller (typically via
-    /// `text.lineBox` + `nextLayoutRect`). Baseline is derived from `rect`
-    /// through `text.baselineInRect`, so horizontal padding baked into
-    /// `rect.x` and the font ascent fully determine the origin. Consumes no
-    /// ID-tracking capacity and touches no interaction state; geometry is
-    /// logically atomic per `text.emitBaseline`. Returns measured metrics.
-    pub fn label(self: *Context, rect: layout.Rect, font_data: font.Font, utf8: []const u8, scale: f32, color: u32, clip_rect: draw.ClipRect) (Error || text.Error || font.Error || draw.Error)!text.Metrics {
+    /// Slider with a UTF-8 caption and a fixed two-decimal value readout.
+    /// The upper portion contains text; the lower portion is the interactive track.
+    /// Caller-owned scalar is committed only after all rendering succeeds.
+    /// Formatting uses a fixed stack buffer and performs no heap allocation.
+    pub fn sliderFloatText(self: *Context, id: ids.Id, rect: layout.Rect, value: *f32, min: f32, max: f32, caption: []const u8, font_data: font.Font, scale: f32, text_color: u32, clip_rect: draw.ClipRect) (Error || interaction.Error || draw.Error || text.Error || font.Error)!bool {
         const checkpoint = try self.checkpointWidget();
         errdefer self.rollbackWidget(checkpoint);
-        const baseline = try text.baselineInRect(rect, font_data, scale);
-        return self.drawTextBaseline(font_data, utf8, baseline, scale, color, clip_rect);
+
+        // Perform all text and geometry validation before interaction changes.
+        const caption_metrics = try text.measure(font_data, caption, scale);
+        const line_height = (font_data.ascent - font_data.descent + font_data.line_gap) * scale;
+        if (!std.math.isFinite(line_height) or line_height <= 0) return error.InvalidScale;
+        if (!std.math.isFinite(rect.x) or !std.math.isFinite(rect.y) or
+            !std.math.isFinite(rect.width) or !std.math.isFinite(rect.height) or
+            rect.width <= 0 or rect.height <= line_height or
+            !std.math.isFinite(rect.y + rect.height) or
+            !std.math.isFinite(rect.x + rect.width)) return error.InvalidGeometry;
+        if (!std.math.isFinite(min) or !std.math.isFinite(max) or !(max > min) or
+            !std.math.isFinite(max - min) or !std.math.isFinite(value.*)) return error.InvalidGeometry;
+
+        const track_y = rect.y + line_height;
+        const track_height = rect.height - line_height;
+        if (!std.math.isFinite(track_y) or !std.math.isFinite(track_height) or track_height <= 0) return error.InvalidGeometry;
+        const track: layout.Rect = .{ .x = rect.x, .y = track_y, .width = rect.width, .height = track_height };
+        const previous = value.*;
+        errdefer value.* = previous;
+        const changed = try self.sliderFloat(id, track, value, min, max, clip_rect);
+
+        var value_buffer: [64]u8 = undefined;
+        const value_text = std.fmt.bufPrint(&value_buffer, "{d:.2}", .{value.*}) catch return error.InvalidGeometry;
+        const value_metrics = try text.measure(font_data, value_text, scale);
+        const caption_x = rect.x;
+        const value_x = rect.x + rect.width - value_metrics.advance_x;
+        const baseline_y = rect.y + font_data.ascent * scale;
+        if (!std.math.isFinite(caption_x + caption_metrics.advance_x) or
+            !std.math.isFinite(value_x) or !std.math.isFinite(baseline_y)) return error.InvalidPosition;
+        _ = try self.drawTextBaseline(font_data, caption, .{ caption_x, baseline_y }, scale, text_color, clip_rect);
+        _ = try self.drawTextBaseline(font_data, value_text, .{ value_x, baseline_y }, scale, text_color, clip_rect);
+        return changed;
     }
 
     /// Closes a frame: building -> ready. Requires balanced ID/clip/layout
@@ -565,6 +952,34 @@ pub const Context = struct {
         self.input = null;
     }
 };
+
+/// Drag selection is only live while the primary button remains down and
+/// interaction capture belongs to this exact widget. A release (including
+/// outside the widget) or window focus loss invalidates caller-owned anchor.
+fn dragCaptureValid(active_id: ?ids.Id, id: ids.Id, snapshot: input_events.Snapshot, result: interaction.Result) bool {
+    return snapshot.focused and (snapshot.buttons_down & 1) != 0 and
+        !snapshot.primary_released and active_id != null and active_id.? == id and
+        (result.held or result.pressed);
+}
+
+test "drag capture persists outside bounds and ends on release" {
+    const testing = std.testing;
+    const id: ids.Id = 41;
+    const held: interaction.Result = .{ .held = true };
+    try testing.expect(dragCaptureValid(id, id, .{ .buttons_down = 1, .pointer_x = -50 }, held));
+    try testing.expect(!dragCaptureValid(id, id, .{ .buttons_down = 0, .primary_released = true }, .{}));
+    try testing.expect(!dragCaptureValid(id, id, .{ .buttons_down = 1, .focused = false }, held));
+}
+
+test "drag capture rejects another widget and stale primary button" {
+    const testing = std.testing;
+    const id: ids.Id = 41;
+    const held: interaction.Result = .{ .held = true };
+    try testing.expect(!dragCaptureValid(@as(ids.Id, 42), id, .{ .buttons_down = 1 }, held));
+    try testing.expect(!dragCaptureValid(null, id, .{ .buttons_down = 1 }, held));
+    try testing.expect(!dragCaptureValid(id, id, .{ .buttons_down = 0 }, held));
+    try testing.expect(!dragCaptureValid(id, id, .{ .buttons_down = 1, .primary_released = true }, held));
+}
 
 fn ensureGeometryDisjoint(bytes: []const u8, g: draw.Buffer) Error!void {
     try ensureDisjoint(bytes, std.mem.sliceAsBytes(g.vertices));
@@ -1432,170 +1847,560 @@ test "stage24_16 unconfigured storage reports MissingStorage, full reports OutOf
     try ctx.releaseFrame();
 }
 
-test "stage25_3 context drawTextBaseline lifecycle and atomic rollback" {
-    const t = std.testing;
-    const sample_glyphs = [_]font.Glyph{
-        .{ .codepoint = 65, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
-    };
-    const test_font: font.Font = .{ .glyphs = &sample_glyphs, .texture = 9, .ascent = 8, .descent = -2, .line_gap = 1 };
-    try test_font.validate();
-    const region: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
-    const frame: FrameInput = .{ .delta_seconds = 0.016, .display_size = .{ .x = 100, .y = 100 } };
-
-    var no_geo: Context = .{};
-    try t.expectError(error.InvalidFrameState, no_geo.drawTextBaseline(test_font, "A", .{ 0, 10 }, 1, 0xffffffff, region));
-    try no_geo.beginFrame(frame);
-    try t.expectError(error.MissingGeometry, no_geo.drawTextBaseline(test_font, "A", .{ 0, 10 }, 1, 0xffffffff, region));
-    try no_geo.endFrame();
-    try no_geo.releaseFrame();
-
-    var vertices: [8]draw.Vertex = undefined;
-    var indices: [12]u32 = undefined;
-    var commands: [2]draw.Command = undefined;
-    var ctx: Context = .{};
-    try ctx.setGeometryStorage(&vertices, &indices, &commands);
-    try ctx.beginFrame(frame);
-    const m = try ctx.drawTextBaseline(test_font, "A", .{ 0, 10 }, 1, 0xffffffff, region);
-    try t.expectEqual(@as(usize, 1), m.glyph_count);
-    try t.expectError(error.MissingGlyph, ctx.drawTextBaseline(test_font, "B", .{ 0, 10 }, 1, 0xffffffff, region));
-    try t.expectEqual(@as(usize, 4), ctx.geometry.?.vertex_count);
-    try t.expectEqual(@as(usize, 6), ctx.geometry.?.index_count);
-    try t.expectEqual(@as(usize, 1), ctx.geometry.?.command_count);
-    try t.expectError(error.InvalidUtf8, ctx.drawTextBaseline(test_font, "\xFF", .{ 0, 10 }, 1, 0xffffffff, region));
-    try t.expectEqual(@as(usize, 4), ctx.geometry.?.vertex_count);
-    _ = try ctx.drawTextBaseline(test_font, "A", .{ 0, 10 }, 1, 0xffffffff, region);
-    try t.expectEqual(@as(usize, 8), ctx.geometry.?.vertex_count);
-    try ctx.endFrame();
-    const view = try ctx.drawDataView();
-    try t.expectEqual(@as(usize, 8), view.vertices.len);
-    try t.expectError(error.InvalidFrameState, ctx.drawTextBaseline(test_font, "A", .{ 0, 10 }, 1, 0xffffffff, region));
-    try ctx.releaseFrame();
-}
-
-test "stage25_4 context text rows use measured height and ascent baseline" {
-    const t = std.testing;
-    const sample_glyphs = [_]font.Glyph{
-        .{ .codepoint = 65, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
-    };
-    const test_font: font.Font = .{ .glyphs = &sample_glyphs, .texture = 9, .ascent = 8, .descent = -2, .line_gap = 1 };
-    try test_font.validate();
-    const region: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 200 };
-    const frame: FrameInput = .{ .delta_seconds = 0.016, .display_size = .{ .x = 200, .y = 200 } };
-    var vertices: [8]draw.Vertex = undefined;
-    var indices: [12]u32 = undefined;
-    var commands: [2]draw.Command = undefined;
-    var ctx: Context = .{};
-    try ctx.setGeometryStorage(&vertices, &indices, &commands);
-    try ctx.beginFrame(frame);
-    try ctx.pushLayout(.{ .x = 10, .y = 20, .width = 100, .height = 90 }, .{ .x = 5, .y = 3 });
-    const box = try text.lineBox(test_font, "A", 1);
-    try t.expectEqual(@as(f32, 11), box.height);
-    const row0 = try ctx.nextLayoutRect(null, box.height);
-    const row1 = try ctx.nextLayoutRect(null, box.height);
-    const base0 = try text.baselineInRect(row0, test_font, 1);
-    const base1 = try text.baselineInRect(row1, test_font, 1);
-    _ = try ctx.drawTextBaseline(test_font, "A", base0, 1, 0xffffffff, region);
-    _ = try ctx.drawTextBaseline(test_font, "A", base1, 1, 0xffffffff, region);
-    try ctx.popLayout();
-    try ctx.endFrame();
-    const view = try ctx.drawDataView();
-    try t.expectEqual(@as(usize, 8), view.vertices.len);
-    try t.expectEqual(@as(usize, 1), view.commands.len);
-    try t.expectEqual(@as(f32, 16), view.vertices[0].x);
-    try t.expectEqual(@as(f32, 21), view.vertices[0].y);
-    try t.expectEqual(@as(f32, 35), view.vertices[4].y);
-    try ctx.releaseFrame();
-}
-
-test "stage25_5 label emits text in layout rect without interaction" {
-    const t = std.testing;
-    const sample_glyphs = [_]font.Glyph{
-        .{ .codepoint = 65, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
-        .{ .codepoint = 66, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
-        .{ .codepoint = 0xE9, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
-    };
-    const test_font: font.Font = .{ .glyphs = &sample_glyphs, .texture = 9, .ascent = 8, .descent = -2, .line_gap = 1 };
-    try test_font.validate();
-    const region: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 200 };
-    const frame: FrameInput = .{ .delta_seconds = 0.016, .display_size = .{ .x = 200, .y = 200 } };
-    var vertices: [16]draw.Vertex = undefined;
-    var indices: [24]u32 = undefined;
-    var commands: [4]draw.Command = undefined;
-    var visited: [4]ids.Id = undefined;
-    var ctx: Context = .{};
-    try ctx.setGeometryStorage(&vertices, &indices, &commands);
-    try ctx.setInteractionIdStorage(&visited);
-    try ctx.beginFrame(frame);
-    try ctx.pushLayout(.{ .x = 10, .y = 20, .width = 100, .height = 90 }, .{ .x = 5, .y = 3 });
-    const box = try text.lineBox(test_font, "AB", 1);
-    const row = try ctx.nextLayoutRect(null, box.height);
-    const m = try ctx.label(row, test_font, "AB", 1, 0xffffffff, region);
-    try t.expectEqual(@as(usize, 2), m.glyph_count);
-    try t.expectEqual(@as(f32, 14), m.advance_x);
-    try t.expectEqual(@as(usize, 8), ctx.geometry.?.vertex_count);
-    try t.expectEqual(@as(usize, 12), ctx.geometry.?.index_count);
-    try t.expectEqual(@as(usize, 1), ctx.geometry.?.command_count);
-    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
-    const uni_row = try ctx.nextLayoutRect(null, box.height);
-    const um = try ctx.label(uni_row, test_font, "A\xC3\xA9", 1, 0xffffffff, region);
-    try t.expectEqual(@as(usize, 2), um.glyph_count);
-    try t.expectEqual(@as(usize, 16), ctx.geometry.?.vertex_count);
-    try t.expectEqual(@as(usize, 1), ctx.geometry.?.command_count);
-    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
-    const empty_row = try ctx.nextLayoutRect(null, box.height);
-    const em = try ctx.label(empty_row, test_font, "", 1, 0xffffffff, region);
-    try t.expectEqual(@as(usize, 0), em.glyph_count);
-    try t.expectEqual(@as(usize, 16), ctx.geometry.?.vertex_count);
-    try ctx.popLayout();
-    try ctx.endFrame();
-    const view = try ctx.drawDataView();
-    try t.expectEqual(@as(usize, 16), view.vertices.len);
-    try ctx.releaseFrame();
-}
-
-test "stage25_5 label failures are atomic and preserve interaction" {
-    const t = std.testing;
-    const sample_glyphs = [_]font.Glyph{
-        .{ .codepoint = 65, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
-    };
-    const test_font: font.Font = .{ .glyphs = &sample_glyphs, .texture = 9, .ascent = 8, .descent = -2, .line_gap = 1 };
-    try test_font.validate();
-    const region: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
-    const frame: FrameInput = .{ .delta_seconds = 0.016, .display_size = .{ .x = 100, .y = 100 } };
-    var vertices: [8]draw.Vertex = undefined;
-    var indices: [12]u32 = undefined;
-    var commands: [2]draw.Command = undefined;
-    var visited: [4]ids.Id = undefined;
-    var ctx: Context = .{};
-    try ctx.setGeometryStorage(&vertices, &indices, &commands);
-    try ctx.setInteractionIdStorage(&visited);
-    try t.expectError(error.InvalidFrameState, ctx.label(.{ .x = 0, .y = 0, .width = 50, .height = 11 }, test_font, "A", 1, 0xffffffff, region));
-    try ctx.beginFrame(frame);
-    const rect: layout.Rect = .{ .x = 0, .y = 0, .width = 50, .height = 11 };
-    try t.expectError(error.MissingGlyph, ctx.label(rect, test_font, "B", 1, 0xffffffff, region));
-    try t.expectEqual(@as(usize, 0), ctx.geometry.?.vertex_count);
-    try t.expectError(error.InvalidScale, ctx.label(rect, test_font, "A", 0, 0xffffffff, region));
-    try t.expectError(error.InvalidUtf8, ctx.label(rect, test_font, "\xFF", 1, 0xffffffff, region));
-    try t.expectEqual(@as(usize, 0), ctx.geometry.?.vertex_count);
-    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
-    _ = try ctx.label(rect, test_font, "A", 1, 0xffffffff, region);
-    try t.expectEqual(@as(usize, 4), ctx.geometry.?.vertex_count);
-    const before_cmd = ctx.geometry.?.commands[0];
-    const before_interaction = ctx.interaction_state;
-    try t.expectError(error.OutOfCapacity, ctx.label(rect, test_font, "AA", 1, 0xffffffff, region));
-    try t.expectEqual(@as(usize, 4), ctx.geometry.?.vertex_count);
-    try t.expectEqual(@as(usize, 6), ctx.geometry.?.index_count);
-    try t.expectEqual(@as(usize, 1), ctx.geometry.?.command_count);
-    try t.expectEqualDeep(before_cmd, ctx.geometry.?.commands[0]);
-    try t.expectEqualDeep(before_interaction, ctx.interaction_state);
-    _ = try ctx.interact(42, .{ .x = 80, .y = 80, .width = 5, .height = 5 });
-    try t.expectEqual(@as(usize, 1), ctx.interaction_state.visited_count);
-    try ctx.endFrame();
-    try ctx.releaseFrame();
-}
-
 // Include text/font contract tests in the root test suite.
 test {
     _ = @import("font.zig");
     _ = @import("text.zig");
+    _ = @import("text_edit.zig");
+}
+
+test "stage25_5 label emits text and advances layout" {
+    const t = std.testing;
+    const glyphs = [_]font.Glyph{.{ .codepoint = 65, .advance_x = 7, .bearing_x = 0, .bearing_y = 8, .width = 6, .height = 9, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 }};
+    const f: font.Font = .{ .glyphs = &glyphs, .texture = 12, .ascent = 9, .descent = -3, .line_gap = 2 };
+    var vertices: [12]draw.Vertex = undefined;
+    var indices: [18]u32 = undefined;
+    var commands: [2]draw.Command = undefined;
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    const clip_rect: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 100, .y = 100 } });
+    try ctx.pushLayout(.{ .x = 10, .y = 20, .width = 80, .height = 70 }, .{ .y = 3 });
+    const first = try ctx.label(f, "AA", 1, 0xffffffff, clip_rect);
+    try t.expectEqual(@as(f32, 14), first.width);
+    try t.expectEqual(@as(f32, 14), first.height);
+    try t.expectEqual(@as(f32, 20), first.y);
+    const second = try ctx.label(f, "A", 1, 0xffffffff, clip_rect);
+    try t.expectEqual(@as(f32, 37), second.y);
+    try t.expectEqual(@as(usize, 12), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 18), ctx.geometry.?.index_count);
+    try t.expectEqual(@as(usize, 1), ctx.geometry.?.command_count);
+    try ctx.popLayout();
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+test "stage25_5 label failure rolls back layout and geometry" {
+    const t = std.testing;
+    const glyphs = [_]font.Glyph{.{ .codepoint = 65, .advance_x = 7, .bearing_x = 0, .bearing_y = 8, .width = 6, .height = 9, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 }};
+    const f: font.Font = .{ .glyphs = &glyphs, .texture = 12, .ascent = 9, .descent = -3, .line_gap = 2 };
+    var vertices: [4]draw.Vertex = undefined;
+    var indices: [6]u32 = undefined;
+    var commands: [1]draw.Command = undefined;
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    const clip_rect: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    try t.expectError(error.InvalidFrameState, ctx.label(f, "A", 1, 0xffffffff, clip_rect));
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 100, .y = 100 } });
+    try ctx.pushLayout(.{ .x = 0, .y = 0, .width = 100, .height = 100 }, .{ .y = 2 });
+    try t.expectError(error.InvalidUtf8, ctx.label(f, &.{0xff}, 1, 0xffffffff, clip_rect));
+    try t.expectError(error.OutOfCapacity, ctx.label(f, "AA", 1, 0xffffffff, clip_rect));
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.command_count);
+    const rect = try ctx.label(f, "A", 1, 0xffffffff, clip_rect);
+    try t.expectEqual(@as(f32, 0), rect.y);
+    try t.expectEqual(@as(usize, 4), ctx.geometry.?.vertex_count);
+    try ctx.popLayout();
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+test "horizontal layout context requires building frame" {
+    const t = std.testing;
+    var ctx: Context = .{};
+    const bounds: layout.Rect = .{ .x = 10, .y = 20, .width = 100, .height = 30 };
+    try t.expectError(error.InvalidFrameState, ctx.pushHorizontalLayout(bounds, .{}));
+}
+
+test "aligned layout context requires building frame" {
+    const t = std.testing;
+    var ctx: Context = .{};
+    try t.expectError(error.InvalidFrameState, ctx.nextAlignedLayoutRect(10, 5, .center));
+}
+
+test "fill remaining context operation requires building frame" {
+    const t = std.testing;
+    var ctx: Context = .{};
+    try t.expectError(error.InvalidFrameState, ctx.nextFillRemainingLayoutRect(5));
+}
+
+test "weighted layout context requires building frame" {
+    const t = std.testing;
+    var ctx: Context = .{};
+    try t.expectError(error.InvalidFrameState, ctx.nextWeightedLayoutRect(1, 2, 1, 10));
+}
+
+test "stage27_0 buttonText emits background and centered caption" {
+    const t = std.testing;
+    const glyphs = [_]font.Glyph{.{ .codepoint = 65, .advance_x = 8, .bearing_x = 0, .bearing_y = 8, .width = 6, .height = 9, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 }};
+    const f: font.Font = .{ .glyphs = &glyphs, .texture = 42, .ascent = 9, .descent = -3, .line_gap = 2 };
+    var vertices: [12]draw.Vertex = undefined;
+    var indices: [18]u32 = undefined;
+    var commands: [3]draw.Command = undefined;
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    const clip_rect: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    try t.expectError(error.InvalidFrameState, ctx.buttonText(1, .{ .x = 0, .y = 0, .width = 40, .height = 20 }, "A", f, 1, 0xffffffff, clip_rect));
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 100, .y = 100 } });
+    try t.expect(!(try ctx.buttonText(1, .{ .x = 10, .y = 10, .width = 40, .height = 20 }, "A", f, 1, 0xffffffff, clip_rect)));
+    try t.expectEqual(@as(usize, 8), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 12), ctx.geometry.?.index_count);
+    try t.expectEqual(@as(usize, 2), ctx.geometry.?.command_count);
+    try t.expectEqual(@as(f32, 26), ctx.geometry.?.vertices[4].x);
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+test "stage27_0 buttonText restores geometry and ID tracking after text capacity failure" {
+    const t = std.testing;
+    const glyphs = [_]font.Glyph{.{ .codepoint = 65, .advance_x = 8, .bearing_x = 0, .bearing_y = 8, .width = 6, .height = 9, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 }};
+    const f: font.Font = .{ .glyphs = &glyphs, .texture = 42, .ascent = 9, .descent = -3, .line_gap = 2 };
+    var vertices: [4]draw.Vertex = undefined;
+    var indices: [6]u32 = undefined;
+    var commands: [1]draw.Command = undefined;
+    var tracked: [2]ids.Id = undefined;
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    try ctx.setInteractionIdStorage(&tracked);
+    const clip_rect: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    const rect: layout.Rect = .{ .x = 10, .y = 10, .width = 40, .height = 20 };
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 100, .y = 100 } });
+    try t.expectError(error.InvalidUtf8, ctx.buttonText(1, rect, &.{0xff}, f, 1, 0xffffffff, clip_rect));
+    try t.expectError(error.OutOfCapacity, ctx.buttonText(1, rect, "A", f, 1, 0xffffffff, clip_rect));
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
+    // The same ID remains usable after both failures.
+    try t.expect(!(try ctx.button(1, rect, clip_rect)));
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+test "stage27_1 checkboxText emits box and caption without changing value" {
+    const t = std.testing;
+    const glyphs = [_]font.Glyph{.{ .codepoint = 65, .advance_x = 8, .bearing_x = 0, .bearing_y = 8, .width = 6, .height = 9, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 }};
+    const f: font.Font = .{ .glyphs = &glyphs, .texture = 42, .ascent = 9, .descent = -3, .line_gap = 2 };
+    var vertices: [12]draw.Vertex = undefined;
+    var indices: [18]u32 = undefined;
+    var commands: [3]draw.Command = undefined;
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    const region: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    const rect: layout.Rect = .{ .x = 10, .y = 10, .width = 70, .height = 20 };
+    var checked = true;
+    try t.expectError(error.InvalidFrameState, ctx.checkboxText(1, rect, &checked, "A", f, 1, 0xffffffff, region));
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 100, .y = 100 } });
+    try t.expect(!(try ctx.checkboxText(1, rect, &checked, "A", f, 1, 0xffffffff, region)));
+    try t.expect(checked);
+    try t.expectEqual(@as(usize, 12), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 18), ctx.geometry.?.index_count);
+    try t.expectEqual(@as(usize, 2), ctx.geometry.?.command_count);
+    try t.expectEqual(@as(f32, 27.5), ctx.geometry.?.vertices[8].x);
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+test "stage27_1 checkboxText rollback preserves caller value and ID after capacity failure" {
+    const t = std.testing;
+    const glyphs = [_]font.Glyph{.{ .codepoint = 65, .advance_x = 8, .bearing_x = 0, .bearing_y = 8, .width = 6, .height = 9, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 }};
+    const f: font.Font = .{ .glyphs = &glyphs, .texture = 42, .ascent = 9, .descent = -3, .line_gap = 2 };
+    var vertices: [4]draw.Vertex = undefined;
+    var indices: [6]u32 = undefined;
+    var commands: [1]draw.Command = undefined;
+    var tracked: [2]ids.Id = undefined;
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    try ctx.setInteractionIdStorage(&tracked);
+    const region: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    const rect: layout.Rect = .{ .x = 10, .y = 10, .width = 70, .height = 20 };
+    var checked = true;
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 100, .y = 100 } });
+    try t.expectError(error.InvalidUtf8, ctx.checkboxText(1, rect, &checked, &.{0xff}, f, 1, 0xffffffff, region));
+    try t.expectError(error.OutOfCapacity, ctx.checkboxText(1, rect, &checked, "A", f, 1, 0xffffffff, region));
+    try t.expect(checked);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
+    try t.expect(!(try ctx.button(1, rect, region)));
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+test "stage27_2 sliderFloatText renders caption and value with caller-owned buffers" {
+    const t = std.testing;
+    const glyphs = [_]font.Glyph{.{ .codepoint = 63, .advance_x = 8, .bearing_x = 0, .bearing_y = 8, .width = 6, .height = 9, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 }};
+    const f: font.Font = .{ .glyphs = &glyphs, .texture = 42, .ascent = 9, .descent = -3, .line_gap = 2, .fallback = 63 };
+    var vertices: [128]draw.Vertex = undefined;
+    var indices: [192]u32 = undefined;
+    var commands: [16]draw.Command = undefined;
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    const region: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 100 };
+    const rect: layout.Rect = .{ .x = 10, .y = 10, .width = 120, .height = 32 };
+    var value: f32 = 0.5;
+    try t.expectError(error.InvalidFrameState, ctx.sliderFloatText(1, rect, &value, 0, 1, "A", f, 1, 0xffffffff, region));
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 200, .y = 100 } });
+    try t.expect(!(try ctx.sliderFloatText(1, rect, &value, 0, 1, "A", f, 1, 0xffffffff, region)));
+    try t.expectEqual(@as(f32, 0.5), value);
+    try t.expectEqual(@as(usize, 28), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 42), ctx.geometry.?.index_count);
+    try t.expectEqual(@as(usize, 2), ctx.geometry.?.command_count);
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+test "stage27_2 sliderFloatText rolls back geometry, IDs and value on errors" {
+    const t = std.testing;
+    const glyphs = [_]font.Glyph{.{ .codepoint = 63, .advance_x = 8, .bearing_x = 0, .bearing_y = 8, .width = 6, .height = 9, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 }};
+    const f: font.Font = .{ .glyphs = &glyphs, .texture = 42, .ascent = 9, .descent = -3, .line_gap = 2, .fallback = 63 };
+    var vertices: [8]draw.Vertex = undefined;
+    var indices: [12]u32 = undefined;
+    var commands: [2]draw.Command = undefined;
+    var tracked: [2]ids.Id = undefined;
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    try ctx.setInteractionIdStorage(&tracked);
+    const region: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 100 };
+    const rect: layout.Rect = .{ .x = 10, .y = 10, .width = 120, .height = 32 };
+    var value: f32 = 0.5;
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 200, .y = 100 } });
+    try t.expectError(error.InvalidUtf8, ctx.sliderFloatText(1, rect, &value, 0, 1, &.{0xff}, f, 1, 0xffffffff, region));
+    try t.expectError(error.OutOfCapacity, ctx.sliderFloatText(1, rect, &value, 0, 1, "A", f, 1, 0xffffffff, region));
+    try t.expectEqual(@as(f32, 0.5), value);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
+    try t.expect(!(try ctx.button(1, rect, region)));
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+test "stage27_3 widget checkpoint rejects corrupted public geometry counts" {
+    const t = std.testing;
+    var vertices: [4]draw.Vertex = undefined;
+    var indices: [6]u32 = undefined;
+    var commands: [1]draw.Command = undefined;
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    const region: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 };
+    const rect: layout.Rect = .{ .x = 10, .y = 10, .width = 30, .height = 20 };
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 100, .y = 100 } });
+
+    ctx.geometry.?.command_count = 2;
+    try t.expectError(error.OutOfCapacity, ctx.button(1, rect, region));
+    try t.expectEqual(@as(usize, 2), ctx.geometry.?.command_count);
+    ctx.geometry.?.command_count = 0;
+
+    ctx.geometry.?.vertex_count = 5;
+    try t.expectError(error.OutOfCapacity, ctx.button(1, rect, region));
+    try t.expectEqual(@as(usize, 5), ctx.geometry.?.vertex_count);
+    ctx.geometry.?.vertex_count = 0;
+
+    ctx.geometry.?.index_count = 7;
+    try t.expectError(error.OutOfCapacity, ctx.button(1, rect, region));
+    try t.expectEqual(@as(usize, 7), ctx.geometry.?.index_count);
+    ctx.geometry.?.index_count = 0;
+
+    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
+    try t.expect(!(try ctx.button(1, rect, region)));
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+test "stage28_13 input text content clip intersects caller and field" {
+    const rect: layout.Rect = .{ .x = 10, .y = 20, .width = 100, .height = 30 };
+    const outer: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 90, .max_y = 100 };
+    const clipped = try Context.inputTextContentClip(rect, 8, outer);
+    try std.testing.expectEqual(@as(f32, 18), clipped.min_x);
+    try std.testing.expectEqual(@as(f32, 20), clipped.min_y);
+    try std.testing.expectEqual(@as(f32, 90), clipped.max_x);
+    try std.testing.expectEqual(@as(f32, 50), clipped.max_y);
+}
+
+test "stage28_13 input text content clip handles disjoint and invalid clips" {
+    const rect: layout.Rect = .{ .x = 10, .y = 20, .width = 100, .height = 30 };
+    const outside: draw.ClipRect = .{ .min_x = 200, .min_y = 200, .max_x = 250, .max_y = 250 };
+    const empty = try Context.inputTextContentClip(rect, 8, outside);
+    try std.testing.expectEqual(empty.min_x, empty.max_x);
+    try std.testing.expectEqual(empty.min_y, empty.max_y);
+    try std.testing.expectError(error.InvalidClip, Context.inputTextContentClip(rect, 8, .{ .min_x = 2, .min_y = 0, .max_x = 1, .max_y = 10 }));
+}
+
+test "input text horizontal offset keeps caret visible" {
+    try std.testing.expectEqual(@as(f32, 0), try Context.inputTextScrollOffset(0, 12, 20));
+    try std.testing.expectEqual(@as(f32, 15), try Context.inputTextScrollOffset(0, 35, 20));
+    try std.testing.expectEqual(@as(f32, 5), try Context.inputTextScrollOffset(15, 5, 20));
+    try std.testing.expectEqual(@as(f32, 15), try Context.inputTextScrollOffset(15, 20, 20));
+    try std.testing.expectEqual(@as(f32, 30), try Context.inputTextScrollOffset(15, 30, 0));
+}
+
+test "input text horizontal offset rejects invalid values" {
+    try std.testing.expectError(error.InvalidPosition, Context.inputTextScrollOffset(-1, 0, 20));
+    try std.testing.expectError(error.InvalidPosition, Context.inputTextScrollOffset(0, -1, 20));
+    try std.testing.expectError(error.InvalidPosition, Context.inputTextScrollOffset(0, 0, -1));
+    try std.testing.expectError(error.InvalidPosition, Context.inputTextScrollOffset(std.math.inf(f32), 0, 20));
+}
+
+test "drag auto-scroll advances in both directions and clamps at zero" {
+    const t = std.testing;
+    try t.expectEqual(@as(f32, 100), try Context.inputTextDragAutoScroll(100, 50, 0, 100, 0.016));
+    try t.expect((try Context.inputTextDragAutoScroll(100, 130, 0, 100, 0.016)) > 100);
+    try t.expect((try Context.inputTextDragAutoScroll(100, -30, 0, 100, 0.016)) < 100);
+    try t.expectEqual(@as(f32, 0), try Context.inputTextDragAutoScroll(0, -100, 0, 100, 0.1));
+    try t.expectEqual(@as(f32, 100), try Context.inputTextDragAutoScroll(100, 130, 0, 100, 0));
+}
+
+test "drag auto-scroll rejects invalid geometry and time" {
+    const t = std.testing;
+    try t.expectError(error.InvalidPosition, Context.inputTextDragAutoScroll(0, 10, 100, 0, 0.016));
+    try t.expectError(error.InvalidPosition, Context.inputTextDragAutoScroll(0, 10, 0, 100, -1));
+    try t.expectError(error.InvalidPosition, Context.inputTextDragAutoScroll(-1, 10, 0, 100, 0.016));
+    try t.expectError(error.InvalidPosition, Context.inputTextDragAutoScroll(0, std.math.inf(f32), 0, 100, 0.016));
+}
+
+// A rendering failure does not roll back already committed caller-owned edits.
+// The widget checkpoint still rolls back geometry and ID bookkeeping.
+test "stage28_22 text render capacity failure retains edit and rolls back widget" {
+    const t = std.testing;
+    const glyphs = [_]font.Glyph{.{ .codepoint = 63, .advance_x = 8, .bearing_x = 0, .bearing_y = 8, .width = 6, .height = 9, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 }};
+    const f: font.Font = .{ .glyphs = &glyphs, .texture = 42, .ascent = 9, .descent = -3, .line_gap = 2, .fallback = 63 };
+    var vertices: [0]draw.Vertex = .{};
+    var indices: [0]u32 = .{};
+    var commands: [0]draw.Command = .{};
+    var tracked: [2]ids.Id = undefined;
+    var storage: [16]u8 = undefined;
+    var editor = try text_edit.Buffer.init(&storage, "A");
+    var scroll: f32 = 0;
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    try ctx.setInteractionIdStorage(&tracked);
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 200, .y = 100 } });
+    try ctx.requestFocus(7);
+    const region: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 100 };
+    const rect: layout.Rect = .{ .x = 10, .y = 10, .width = 120, .height = 24 };
+    const events = [_]input_events.Event{.{ .text = 'B' }};
+    try t.expectEqual(Context.TextRenderFailurePolicy.retain_edits, Context.text_render_failure_policy);
+    try t.expectError(error.OutOfCapacity, ctx.inputTextScrolled(7, rect, &editor, &events, false, f, 1, 0xffffffff, region, &scroll));
+    try t.expectEqualStrings("AB", editor.view());
+    try t.expectEqual(@as(usize, 2), editor.cursor);
+    try t.expectEqual(@as(f32, 0), scroll);
+    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.index_count);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.command_count);
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+// The tracked visual API must expose consumed events even when geometry fails.
+test "stage28_24 tracked render failure reports consumed events" {
+    const t = std.testing;
+    const glyphs = [_]font.Glyph{.{ .codepoint = 63, .advance_x = 8, .bearing_x = 0, .bearing_y = 8, .width = 6, .height = 9, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 }};
+    const f: font.Font = .{ .glyphs = &glyphs, .texture = 42, .ascent = 9, .descent = -3, .line_gap = 2, .fallback = 63 };
+    var vertices: [0]draw.Vertex = .{};
+    var indices: [0]u32 = .{};
+    var commands: [0]draw.Command = .{};
+    var tracked: [2]ids.Id = undefined;
+    var storage: [16]u8 = undefined;
+    var editor = try text_edit.Buffer.init(&storage, "A");
+    var scroll: f32 = 0;
+    var anchor: ?usize = null;
+    var progress: text_input.Progress = .{};
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    try ctx.setInteractionIdStorage(&tracked);
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 200, .y = 100 } });
+    try ctx.requestFocus(7);
+    const clip_rect: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 100 };
+    const rect: layout.Rect = .{ .x = 10, .y = 10, .width = 120, .height = 24 };
+    const events = [_]input_events.Event{ .{ .text = 'B' }, .{ .text = 'C' } };
+    try t.expectError(error.OutOfCapacity, ctx.inputTextDraggedTracked(7, rect, &editor, &events, false, f, 1, 0xffffffff, clip_rect, &scroll, &anchor, &progress));
+    try t.expectEqual(@as(usize, 2), progress.consumed);
+    try t.expectEqual(@as(usize, 2), progress.changes);
+    try t.expect(progress.focused);
+    try t.expectEqualStrings("ABC", editor.view());
+    try t.expectEqual(@as(f32, 0), scroll);
+    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.index_count);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.command_count);
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+test "stage28_24 tracked edit failure supports next frame suffix" {
+    const t = std.testing;
+    const glyphs = [_]font.Glyph{.{ .codepoint = 63, .advance_x = 8, .bearing_x = 0, .bearing_y = 8, .width = 6, .height = 9, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 }};
+    const f: font.Font = .{ .glyphs = &glyphs, .texture = 42, .ascent = 9, .descent = -3, .line_gap = 2, .fallback = 63 };
+    var vertices: [64]draw.Vertex = undefined;
+    var indices: [96]u32 = undefined;
+    var commands: [16]draw.Command = undefined;
+    var tracked: [2]ids.Id = undefined;
+    var storage: [2]u8 = undefined;
+    var editor = try text_edit.Buffer.init(&storage, "A");
+    var scroll: f32 = 0;
+    var anchor: ?usize = null;
+    var progress: text_input.Progress = .{};
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    try ctx.setInteractionIdStorage(&tracked);
+    const clip_rect: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 100 };
+    const rect: layout.Rect = .{ .x = 10, .y = 10, .width = 120, .height = 24 };
+    const events = [_]input_events.Event{
+        .{ .text = 'B' },
+        .{ .text = 'C' },
+        .{ .key = .{ .code = text_input.Keys.left, .down = true } },
+    };
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 200, .y = 100 } });
+    try ctx.requestFocus(7);
+    try t.expectError(error.OutOfCapacity, ctx.inputTextDraggedTracked(7, rect, &editor, &events, false, f, 1, 0xffffffff, clip_rect, &scroll, &anchor, &progress));
+    try t.expectEqual(@as(usize, 1), progress.consumed);
+    try t.expectEqual(@as(usize, 1), progress.changes);
+    try t.expectEqualStrings("AB", editor.view());
+    try t.expectEqual(@as(usize, 2), editor.cursor);
+    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+
+    // The engine explicitly drops the failed insertion and submits only the
+    // unconsumed movement event. It MUST NOT replay the successful 'B'.
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 200, .y = 100 } });
+    try ctx.requestFocus(7);
+    const remaining = events[2..];
+    try t.expectEqual(@as(usize, 0), try ctx.inputTextDraggedTracked(7, rect, &editor, remaining, progress.shift, f, 1, 0xffffffff, clip_rect, &scroll, &anchor, &progress));
+    try t.expectEqual(@as(usize, 1), progress.consumed);
+    try t.expectEqual(@as(usize, 0), progress.changes);
+    try t.expectEqualStrings("AB", editor.view());
+    try t.expectEqual(@as(usize, 1), editor.cursor);
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+// A render failure after interaction rollback must not leave a stale drag
+// anchor that could be mistaken for an active capture on a later frame.
+test "stage28_26 render failure invalidates caller drag anchor" {
+    const t = std.testing;
+    const glyphs = [_]font.Glyph{.{ .codepoint = 63, .advance_x = 8, .bearing_x = 0, .bearing_y = 8, .width = 6, .height = 9, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 }};
+    const f: font.Font = .{ .glyphs = &glyphs, .texture = 42, .ascent = 9, .descent = -3, .line_gap = 2, .fallback = 63 };
+    var vertices: [0]draw.Vertex = .{};
+    var indices: [0]u32 = .{};
+    var commands: [0]draw.Command = .{};
+    var tracked: [2]ids.Id = undefined;
+    var storage: [8]u8 = undefined;
+    var editor = try text_edit.Buffer.init(&storage, "A");
+    var scroll: f32 = 0;
+    var anchor: ?usize = 0;
+    var progress: text_input.Progress = .{};
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    try ctx.setInteractionIdStorage(&tracked);
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 200, .y = 100 } });
+    try ctx.requestFocus(7);
+    const clip_rect: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 100 };
+    const rect: layout.Rect = .{ .x = 10, .y = 10, .width = 120, .height = 24 };
+    const events = [_]input_events.Event{.{ .text = 'B' }};
+    try t.expectError(error.OutOfCapacity, ctx.inputTextDraggedTracked(7, rect, &editor, &events, false, f, 1, 0xffffffff, clip_rect, &scroll, &anchor, &progress));
+    try t.expectEqual(@as(?usize, null), anchor);
+    try t.expectEqualStrings("AB", editor.view());
+    try t.expectEqual(@as(usize, 1), progress.consumed);
+    try t.expectEqual(@as(f32, 0), scroll);
+    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.vertex_count);
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+// Externally corrupted UTF-8 is rejected before interaction or event replay.
+// The caller can repair its storage and retry without losing the drag anchor.
+test "stage28_27 tracked preflight rejects invalid UTF-8 without consuming events" {
+    const t = std.testing;
+    const glyphs = [_]font.Glyph{.{ .codepoint = 63, .advance_x = 8, .bearing_x = 0, .bearing_y = 8, .width = 6, .height = 9, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 }};
+    const f: font.Font = .{ .glyphs = &glyphs, .texture = 42, .ascent = 9, .descent = -3, .line_gap = 2, .fallback = 63 };
+    var vertices: [16]draw.Vertex = undefined;
+    var indices: [24]u32 = undefined;
+    var commands: [4]draw.Command = undefined;
+    var tracked: [2]ids.Id = undefined;
+    var storage: [8]u8 = undefined;
+    var editor = try text_edit.Buffer.init(&storage, "A");
+    storage[0] = 0xff; // External corruption; len and cursor are still in range.
+    var scroll: f32 = 0;
+    var anchor: ?usize = 0;
+    var progress: text_input.Progress = .{ .consumed = 99, .changes = 99 };
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    try ctx.setInteractionIdStorage(&tracked);
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 200, .y = 100 } });
+    try ctx.requestFocus(7);
+    const clip_rect: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 100 };
+    const rect: layout.Rect = .{ .x = 10, .y = 10, .width = 120, .height = 24 };
+    const events = [_]input_events.Event{.{ .text = 'B' }};
+    try t.expectError(error.InvalidUtf8, ctx.inputTextDraggedTracked(7, rect, &editor, &events, false, f, 1, 0xffffffff, clip_rect, &scroll, &anchor, &progress));
+    try t.expectEqual(@as(u8, 0xff), storage[0]);
+    try t.expectEqual(@as(usize, 1), editor.len);
+    try t.expectEqual(@as(usize, 1), editor.cursor);
+    try t.expectEqual(@as(?usize, 0), anchor);
+    try t.expectEqual(@as(f32, 0), scroll);
+    try t.expectEqual(@as(usize, 0), progress.consumed);
+    try t.expectEqual(@as(usize, 0), progress.changes);
+    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.index_count);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.command_count);
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+// Preflight errors must not claim a widget ID, emit geometry, consume input,
+// or mutate the editor. The progress output is deterministic even on failure.
+test "stage28_25 tracked preflight rejects invalid scroll without side effects" {
+    const t = std.testing;
+    const glyphs = [_]font.Glyph{.{ .codepoint = 63, .advance_x = 8, .bearing_x = 0, .bearing_y = 8, .width = 6, .height = 9, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 }};
+    const f: font.Font = .{ .glyphs = &glyphs, .texture = 42, .ascent = 9, .descent = -3, .line_gap = 2, .fallback = 63 };
+    var vertices: [16]draw.Vertex = undefined;
+    var indices: [24]u32 = undefined;
+    var commands: [4]draw.Command = undefined;
+    var tracked: [2]ids.Id = undefined;
+    var storage: [8]u8 = undefined;
+    var editor = try text_edit.Buffer.init(&storage, "A");
+    var scroll: f32 = -1;
+    var anchor: ?usize = 0;
+    var progress: text_input.Progress = .{ .consumed = 99, .changes = 99, .shift = false, .focused = true };
+    var ctx: Context = .{};
+    try ctx.setGeometryStorage(&vertices, &indices, &commands);
+    try ctx.setInteractionIdStorage(&tracked);
+    try ctx.beginFrame(.{ .delta_seconds = 0.016, .display_size = .{ .x = 200, .y = 100 } });
+    try ctx.requestFocus(7);
+    const clip_rect: draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 100 };
+    const rect: layout.Rect = .{ .x = 10, .y = 10, .width = 120, .height = 24 };
+    const events = [_]input_events.Event{.{ .text = 'B' }};
+    try t.expectError(error.InvalidPosition, ctx.inputTextDraggedTracked(7, rect, &editor, &events, true, f, 1, 0xffffffff, clip_rect, &scroll, &anchor, &progress));
+    try t.expectEqualStrings("A", editor.view());
+    try t.expectEqual(@as(usize, 1), editor.cursor);
+    try t.expectEqual(@as(f32, -1), scroll);
+    try t.expectEqual(@as(?usize, 0), anchor);
+    try t.expectEqual(@as(usize, 0), progress.consumed);
+    try t.expectEqual(@as(usize, 0), progress.changes);
+    try t.expect(progress.shift);
+    try t.expect(!progress.focused);
+    try t.expectEqual(@as(usize, 0), ctx.interaction_state.visited_count);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.vertex_count);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.index_count);
+    try t.expectEqual(@as(usize, 0), ctx.geometry.?.command_count);
+    try ctx.endFrame();
+    try ctx.releaseFrame();
+}
+
+// Explicitly include every subsystem's tests in `zig build test`.
+// Public module exports alone do not document the intended test coverage.
+test "all NitroUI subsystem tests are reachable" {
+    _ = @import("memory.zig");
+    _ = @import("input.zig");
+    _ = @import("ids.zig");
+    _ = @import("state.zig");
+    _ = @import("draw.zig");
+    _ = @import("clip.zig");
+    _ = @import("layout.zig");
+    _ = @import("interaction.zig");
+    _ = @import("style.zig");
+    _ = @import("font.zig");
+    _ = @import("text.zig");
+    _ = @import("text_edit.zig");
+    _ = @import("text_input.zig");
 }

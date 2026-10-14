@@ -2,13 +2,10 @@
 //! Build and run: zig build bench -Doptimize=ReleaseFast
 //! This workload uses caller-owned fixed-capacity buffers and never requests an allocator.
 //! Geometry, checksums and buffer-capacity metrics are deterministic.
-//! Cases per size: `rect` (raw geometry only), `widget` (input events,
-//! vertical layout, integer-ID buttons exercising interaction and batching),
-//! `idstr` (same widget path but with hierarchical string IDs, covering
-//! ID hashing and scope push/pop per widget), `text` (layout + one ASCII
-//! label per row: UTF-8 decode, glyph lookup, measure, UV emission), and
-//! `textuni` (same label path cycling 1/2/3/4-byte hits plus a fallback
-//! miss per 5 rows). `textlong` cases emit one long ASCII label per frame.
+//! Two cases per size: `rect` (raw geometry only), `widget` (input events,
+//! vertical layout, integer-ID buttons exercising interaction and batching)
+//! and `idstr` (same widget path but with hierarchical string IDs, covering
+//! ID hashing and scope push/pop per widget).
 //! Wall-clock timing uses a small monotonic-clock helper in this bench harness
 //! only; the nitro_ui module itself has no clock dependency. Timing values are
 //! machine-specific: warm-up frames are excluded, then per-frame nanoseconds
@@ -22,18 +19,7 @@ const frames_per_case: usize = 300;
 const counts = [_]usize{ 64, 256, 1024, 4096 };
 const region: ui.draw.ClipRect = .{ .min_x = 0, .min_y = 0, .max_x = 2048, .max_y = 2048 };
 
-const Workload = enum { rect, widget, idstr, text, textuni };
-
-/// Engine-owned font for the text workloads. Validated once in main;
-/// per-frame work is decode + lookup + measure + UV emission only.
-const bench_glyphs = [_]ui.font.Glyph{
-    .{ .codepoint = 63, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
-    .{ .codepoint = 65, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
-    .{ .codepoint = 0xE9, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
-    .{ .codepoint = 0x20AC, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
-    .{ .codepoint = 0x1F600, .advance_x = 7, .bearing_x = 1, .bearing_y = 7, .width = 6, .height = 8, .u0 = 0.1, .v0 = 0.2, .u1 = 0.3, .v1 = 0.4 },
-};
-const bench_font = ui.font.Font{ .glyphs = &bench_glyphs, .texture = 9, .ascent = 8, .descent = -2, .line_gap = 1, .fallback = 63 };
+const Workload = enum { rect, widget, idstr };
 
 fn emitRects(ctx: *ui.Context, comptime count: usize) !void {
     for (0..count) |i| {
@@ -69,51 +55,7 @@ fn emitCase(ctx: *ui.Context, comptime count: usize, comptime workload: Workload
         .rect => try emitRects(ctx, count),
         .widget => try emitWidgets(ctx, count),
         .idstr => try emitIdWidgets(ctx, count),
-        .text => try emitTextAscii(ctx, count),
-        .textuni => try emitTextUni(ctx, count),
     }
-}
-
-/// Label path per frame: one pointer event (harness uniformity), a vertical
-/// layout region, and one single-glyph ASCII label per row. All labels share
-/// one texture/clip, so the frame batches into one command exactly like the
-/// rect/widget cases, isolating decode + lookup + measure + UV cost.
-fn emitTextAscii(ctx: *ui.Context, comptime count: usize) !void {
-    const events = [_]ui.input_events.Event{
-        .{ .pointer_move = .{ .x = 5, .y = 5 } },
-    };
-    try ctx.processEvents(&events);
-    const line_h = try ui.text.lineHeight(bench_font, 1);
-    try ctx.pushLayout(
-        .{ .x = 0, .y = 0, .width = 2048, .height = @as(f32, @floatFromInt(count)) * line_h },
-        .{ .x = 0, .y = 0 },
-    );
-    for (0..count) |_| {
-        const rect = try ctx.nextLayoutRect(null, line_h);
-        _ = try ctx.label(rect, bench_font, "A", 1, 0xffffffff, region);
-    }
-    try ctx.popLayout();
-}
-
-/// Same label path, cycling 1/2/3/4-byte hits plus a fallback miss ("Z"
-/// resolves through fallback 63). Per-row geometry is still one quad, so
-/// output verification matches the other per-widget cases.
-fn emitTextUni(ctx: *ui.Context, comptime count: usize) !void {
-    const samples = [_][]const u8{ "A", "\xC3\xA9", "\xE2\x82\xAC", "\xF0\x9F\x98\x80", "Z" };
-    const events = [_]ui.input_events.Event{
-        .{ .pointer_move = .{ .x = 5, .y = 5 } },
-    };
-    try ctx.processEvents(&events);
-    const line_h = try ui.text.lineHeight(bench_font, 1);
-    try ctx.pushLayout(
-        .{ .x = 0, .y = 0, .width = 2048, .height = @as(f32, @floatFromInt(count)) * line_h },
-        .{ .x = 0, .y = 0 },
-    );
-    for (0..count) |i| {
-        const rect = try ctx.nextLayoutRect(null, line_h);
-        _ = try ctx.label(rect, bench_font, samples[i % samples.len], 1, 0xffffffff, region);
-    }
-    try ctx.popLayout();
 }
 
 /// Same widget path as emitWidgets, but each button uses a hierarchical
@@ -245,80 +187,80 @@ fn runCase(comptime count: usize, comptime workload: Workload) !void {
     });
 }
 
-pub fn main() !void {
-    try bench_font.validate();
-    inline for (counts) |count| try runCase(count, .rect);
-    inline for (counts) |count| try runCase(count, .widget);
-    inline for (counts) |count| try runCase(count, .idstr);
-    inline for (counts) |count| try runCase(count, .text);
-    inline for (counts) |count| try runCase(count, .textuni);
-    inline for (long_counts) |chars| try runTextLong(chars);
-}
+// Text benchmark: one ASCII or multibyte Unicode glyph per label. Font and
+// atlas descriptors are engine-owned; fixed geometry buffers are reused.
+// The benchmark measures the full frame + label layout + text emission path.
+const TextCase = enum { ascii, unicode };
 
-/// One long single-line ASCII label per frame. Filled once, emitted every
-/// frame through layout + label; verifies glyph-count scaling and the
-/// single-command batching contract for long strings.
-fn runTextLong(comptime chars: usize) !void {
-    var vertices: [chars * 4]ui.draw.Vertex = undefined;
-    var indices: [chars * 6]u32 = undefined;
+fn runTextCase(comptime count: usize, comptime kind: TextCase) !void {
+    const codepoint: u21 = if (kind == .ascii) 'A' else 0x20AC;
+    const sample: []const u8 = if (kind == .ascii) "A" else "€";
+    const glyphs = [_]ui.font.Glyph{.{
+        .codepoint = codepoint,
+        .advance_x = 8,
+        .bearing_x = 0,
+        .bearing_y = 8,
+        .width = 7,
+        .height = 9,
+        .u0 = 0,
+        .v0 = 0,
+        .u1 = 1,
+        .v1 = 1,
+    }};
+    const font: ui.font.Font = .{
+        .glyphs = &glyphs,
+        .texture = 7,
+        .ascent = 8,
+        .descent = -2,
+        .line_gap = 0,
+    };
+    try font.validate();
+    var vertices: [count * 4]ui.draw.Vertex = undefined;
+    var indices: [count * 6]u32 = undefined;
     var commands: [1]ui.draw.Command = undefined;
     var ctx: ui.Context = .{};
     try ctx.setGeometryStorage(&vertices, &indices, &commands);
-
     const input: ui.FrameInput = .{
         .delta_seconds = 1.0 / 60.0,
-        .display_size = .{ .x = 4096, .y = 4096 },
+        .display_size = .{ .x = 2048, .y = 2048 },
     };
-    var glyphs: [chars]u8 = undefined;
-    @memset(&glyphs, 'A');
-    const line_h = try ui.text.lineHeight(bench_font, 1);
-
-    for (0..warmup_frames) |_| {
-        try ctx.beginFrame(input);
-        try ctx.pushLayout(.{ .x = 0, .y = 0, .width = 4096, .height = line_h }, .{ .x = 0, .y = 0 });
-        const row = try ctx.nextLayoutRect(null, line_h);
-        _ = try ctx.label(row, bench_font, &glyphs, 1, 0xffffffff, region);
-        try ctx.popLayout();
-        try ctx.endFrame();
-        _ = try ctx.drawDataView();
-        try ctx.releaseFrame();
-    }
-
     var times: [frames_per_case]u64 = undefined;
     var checksum: u64 = 0;
-    for (0..frames_per_case) |f| {
-        const start = try monoNanos();
+    for (0..warmup_frames + frames_per_case) |frame| {
+        const start = if (frame >= warmup_frames) try monoNanos() else @as(u64, 0);
         try ctx.beginFrame(input);
-        try ctx.pushLayout(.{ .x = 0, .y = 0, .width = 4096, .height = line_h }, .{ .x = 0, .y = 0 });
-        const row = try ctx.nextLayoutRect(null, line_h);
-        const m = try ctx.label(row, bench_font, &glyphs, 1, 0xffffffff, region);
-        if (m.glyph_count != chars) return error.InvalidBenchmarkOutput;
+        try ctx.pushLayout(
+            .{ .x = 0, .y = 0, .width = 2048, .height = @as(f32, @floatFromInt(count)) * 10 },
+            .{},
+        );
+        for (0..count) |_| {
+            _ = try ctx.label(font, sample, 1, 0xffffffff, region);
+        }
         try ctx.popLayout();
         try ctx.endFrame();
         const data = try ctx.drawDataView();
-        if (data.vertices.len != chars * 4 or data.indices.len != chars * 6 or data.commands.len != 1)
+        if (data.vertices.len != count * 4 or data.indices.len != count * 6 or data.commands.len != 1)
             return error.InvalidBenchmarkOutput;
-        if (data.commands[0].index_count != chars * 6)
+        if (data.commands[0].index_count != count * 6 or data.commands[0].texture != font.texture)
             return error.InvalidBenchmarkOutput;
         checksum +%= @as(u64, @intCast(data.vertices.len));
-        checksum +%= @as(u64, @intCast(data.indices.len));
-        checksum +%= @as(u64, @intCast(data.commands.len));
         try ctx.releaseFrame();
-        const end = try monoNanos();
-        times[f] = end - start;
+        if (frame >= warmup_frames) {
+            const end = try monoNanos();
+            times[frame - warmup_frames] = end - start;
+        }
     }
     sortU64(times[0..]);
-    const ns_min = times[0];
-    const ns_med = times[frames_per_case / 2];
-    const ns_p90 = times[frames_per_case * 9 / 10];
-    const ns_max = times[frames_per_case - 1];
-    const geometry_bytes = @sizeOf(ui.draw.Vertex) * chars * 4 +
-        @sizeOf(u32) * chars * 6 + @sizeOf(ui.draw.Command);
-    std.debug.print("case=textlong chars={d} frames={d} vertices/frame={d} indices/frame={d} commands/frame=1 checksum={d} geometry_capacity_bytes={d} ns_frame_min={d} ns_frame_med={d} ns_frame_p90={d} ns_frame_max={d} ns_char_med={d}\n", .{
-        chars,          frames_per_case, chars * 4, chars * 6, checksum,
-        geometry_bytes, ns_min,          ns_med,    ns_p90,    ns_max,
-        ns_med / chars,
+    std.debug.print("case=text_{s} labels={d} frames={d} vertices/frame={d} indices/frame={d} commands/frame=1 checksum={d} ns_frame_min={d} ns_frame_med={d} ns_frame_p90={d} ns_frame_max={d} ns_label_med={d}\n", .{
+        @tagName(kind), count,                      frames_per_case,                 count * 4,                  count * 6,                          checksum,
+        times[0],       times[frames_per_case / 2], times[frames_per_case * 9 / 10], times[frames_per_case - 1], times[frames_per_case / 2] / count,
     });
 }
 
-const long_counts = [_]usize{ 64, 256, 1024 };
+pub fn main() !void {
+    inline for (counts) |count| try runCase(count, .rect);
+    inline for (counts) |count| try runCase(count, .widget);
+    inline for (counts) |count| try runCase(count, .idstr);
+    inline for (counts) |count| try runTextCase(count, .ascii);
+    inline for (counts) |count| try runTextCase(count, .unicode);
+}
