@@ -1,0 +1,22 @@
+name: Feature request
+description: Suggest an API or capability
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Engine-side use case
+      description: Describe the problem and constraints.
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed API and ownership model
+    validations:
+      required: true
+  - type: textarea
+    id: performance
+    attributes:
+      label: Performance and compatibility considerations
